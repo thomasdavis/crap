@@ -46,7 +46,7 @@ const RETENTION = {
   schema: { type: 'string', enum: ['session', 'P30D', 'indefinite'] },
 };
 
-async function boot({ evaluate, verifyEvidence, maxRounds, proofMode } = {}) {
+async function boot({ evaluate, verifyEvidence, maxRounds, proofMode, grantScope, grantDescription } = {}) {
   const served = [];
   let server;
   const http = createServer(async (req, res) => {
@@ -79,6 +79,8 @@ async function boot({ evaluate, verifyEvidence, maxRounds, proofMode } = {}) {
     ...(verifyEvidence ? { verifyEvidence } : {}),
     ...(maxRounds ? { maxRounds } : {}),
     ...(proofMode ? { proofMode } : {}),
+    ...(grantScope ? { grantScope } : {}),
+    ...(grantDescription ? { grantDescription } : {}),
   });
 
   return { origin, served, server, close: () => new Promise((r) => http.close(r)) };
@@ -659,4 +661,50 @@ test('deny is final and carries no challenge', async (t) => {
 
 test('content digest uses the RFC 9530 representation', () => {
   assert.match(contentDigest('hello'), /^sha-256=:[A-Za-z0-9+/]+=*:$/);
+});
+
+test('an origin grant buys the origin, and says so on the challenge', async (t) => {
+  const app = await boot({
+    evaluate: (ctx, satisfied) => (satisfied ? allow() : inputRequired([PURPOSE])),
+    grantScope: 'origin',
+    grantDescription: 'anything at this origin for 30 minutes',
+  });
+  t.after(() => app.close());
+
+  const res = await fetch(`${app.origin}/v1/records`, { headers: { [HEADER_ACCEPT]: ACCEPT_VALUE } });
+  const { challenge } = await res.json();
+  assert.equal(challenge.continuation.grant.scope, 'origin');
+  assert.equal(challenge.continuation.grant.description, 'anything at this origin for 30 minutes');
+
+  const submission = await fetch(challenge.submission.target, {
+    method: 'POST',
+    headers: { 'content-type': challenge.submission.content_type },
+    body: JSON.stringify({
+      challenge_id: challenge.id, request_state: challenge.request_state,
+      response_id: 'rsp_grant', input_responses: { purpose: 'academic_research' },
+    }),
+  });
+  const proof = submission.headers.get('input-proof');
+
+  // The whole point: a different URL is now covered, because that is what was sold.
+  const elsewhere = await fetch(`${app.origin}/v1/something-else`, {
+    headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
+  });
+  assert.equal(elsewhere.status, 200, 'an origin grant must cover other paths');
+
+  // It must still not cross origins or principals.
+  const otherPrincipal = await fetch(`${app.origin}/v1/records`, {
+    headers: { 'input-proof': proof, 'x-principal': 'someone-else', [HEADER_ACCEPT]: ACCEPT_VALUE },
+  });
+  assert.equal(otherPrincipal.status, 403, 'still bound to the principal');
+});
+
+test('a request grant still binds to the exact request', async (t) => {
+  const app = await boot({ evaluate: (ctx, s) => (s ? allow() : inputRequired([PURPOSE])) });
+  t.after(() => app.close());
+  const { proof } = await earnProof(app.origin);
+  const elsewhere = await fetch(`${app.origin}/v1/other`, {
+    headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
+  });
+  assert.equal(elsewhere.status, 403, 'default grant must not leak to other paths');
 });

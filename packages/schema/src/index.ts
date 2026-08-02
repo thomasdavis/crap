@@ -209,6 +209,22 @@ export interface Challenge {
   };
   continuation: {
     mode: 'retry-original-request' | 'complete-on-submit';
+    /**
+     * What satisfying this challenge actually buys.
+     *
+     * Without this a client cannot price the exchange: it is being asked to
+     * spend real compute for an unstated return, and the safe assumption —
+     * that it buys exactly the one request it was making — makes almost any
+     * task a bad deal. An issuer that wants compliance should say what the
+     * answer is worth, and is then bound by it.
+     */
+    grant?: {
+      /** `request`: this method+URI only. `origin`: anything at this origin. */
+      scope: 'request' | 'origin';
+      duration_seconds: number;
+      /** Optional human-readable summary, e.g. "unlimited reads for 30 min". */
+      description?: string;
+    };
   };
   max_rounds: number;
   round: number;

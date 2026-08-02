@@ -179,6 +179,14 @@ export interface CrapServerOptions {
   maxRounds?: number;
   /** Seconds an issued Input-Proof is good for. Default 300. */
   proofTtlSeconds?: number;
+  /**
+   * What a satisfied challenge buys. Default `request` — the narrowest, safest
+   * grant. `origin` is appropriate when the challenge is a toll rather than an
+   * authorisation step: the client is paying for access to a site, and binding
+   * the proof to one URI makes the price absurd.
+   */
+  grantScope?: 'request' | 'origin';
+  grantDescription?: string;
   policyVersion?: string;
 }
 
@@ -201,6 +209,8 @@ export class CrapServer {
       decisions: new MemoryDecisionStore(),
       verifyEvidence: () => null,
       proofMode: 'opaque',
+      grantScope: 'request',
+      grantDescription: undefined as unknown as string,
       ttlSeconds: 900,
       maxRounds: 3,
       proofTtlSeconds: 300,
@@ -298,7 +308,14 @@ export class CrapServer {
         target: new URL(submissionPath(id), this.opts.issuer).toString(),
         content_type: RESPONSE_MEDIA_TYPE,
       },
-      continuation: { mode: 'retry-original-request' },
+      continuation: {
+        mode: 'retry-original-request',
+        grant: {
+          scope: this.opts.grantScope,
+          duration_seconds: this.opts.proofTtlSeconds,
+          ...(this.opts.grantDescription ? { description: this.opts.grantDescription } : {}),
+        },
+      },
       max_rounds: this.opts.maxRounds,
       round,
       ...(this.opts.policyVersion ? { policy_version: this.opts.policyVersion } : {}),
@@ -561,7 +578,18 @@ export class CrapServer {
     return 'scope mismatch';
   }
 
+  /**
+   * The proof binding, which follows the grant the challenge declared.
+   *
+   * An `origin` grant intentionally omits method, target and content: the
+   * client paid for access to the site, so binding it to one URI would be
+   * selling something other than what was advertised. It still binds origin,
+   * principal and expiry, and remains single-issuer and short-lived.
+   */
   private scopeHash(scope: Challenge['scope']): string {
+    if (this.opts.grantScope === 'origin') {
+      return sha256(JSON.stringify([this.opts.issuer, 'origin-grant', scope.principal ?? null]));
+    }
     return sha256(
       JSON.stringify([
         this.opts.issuer,
