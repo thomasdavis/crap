@@ -104,11 +104,20 @@ export interface DecisionRecord {
   answers: Record<string, GradedAnswer>;
   declined: string[];
   expiresAt: number;
+  /** Requests this grant covers; null = unmetered. */
+  maxUses?: number | null;
+  /** Requests already spent against it. */
+  uses?: number;
 }
 
 export interface DecisionStore {
   put(record: DecisionRecord): Promise<void>;
   get(id: string): Promise<DecisionRecord | undefined>;
+  /**
+   * Spend one request against a metered grant. Returns false when exhausted.
+   * A store that omits this is treated as unmetered.
+   */
+  spend?(id: string): Promise<{ ok: boolean; remaining: number | null }>;
 }
 
 export class MemoryChallengeStore implements ChallengeStore {
@@ -140,6 +149,16 @@ export class MemoryChallengeStore implements ChallengeStore {
 
 export class MemoryDecisionStore implements DecisionStore {
   private live = new Map<string, DecisionRecord>();
+
+  async spend(id: string): Promise<{ ok: boolean; remaining: number | null }> {
+    const record = this.live.get(id);
+    if (!record) return { ok: false, remaining: 0 };
+    if (record.maxUses == null) return { ok: true, remaining: null };
+    const used = (record.uses ?? 0) + 1;
+    if (used > record.maxUses) return { ok: false, remaining: 0 };
+    record.uses = used;
+    return { ok: true, remaining: record.maxUses - used };
+  }
 
   async put(record: DecisionRecord): Promise<void> {
     this.live.set(record.id, record);
@@ -187,6 +206,12 @@ export interface CrapServerOptions {
    */
   grantScope?: 'request' | 'origin';
   grantDescription?: string;
+  /**
+   * Requests a satisfied challenge covers. Null/undefined = unmetered for the
+   * duration. A number makes the exchange proportional and is usually the
+   * honest way to price work.
+   */
+  grantRequestLimit?: number | null;
   policyVersion?: string;
 }
 
@@ -211,6 +236,7 @@ export class CrapServer {
       proofMode: 'opaque',
       grantScope: 'request',
       grantDescription: undefined as unknown as string,
+      grantRequestLimit: null,
       ttlSeconds: 900,
       maxRounds: 3,
       proofTtlSeconds: 300,
@@ -229,12 +255,19 @@ export class CrapServer {
 
     const proof = header(ctx.headers, HEADER_INPUT_PROOF);
     let satisfied: SatisfiedInput | undefined;
+    let proofNote = '';
     if (proof) {
       const verified = await this.verifyInputProof(proof, ctx);
-      if (!verified.ok) {
-        return { kind: 'respond', response: this.problem(ctx, STATUS_COMPAT, 'Invalid Input Proof', verified.reason) };
+      if (verified.ok) {
+        satisfied = verified.satisfied;
+      } else {
+        // A proof that is expired, exhausted, or bound to something else means
+        // the client simply does not have access right now. That is the state
+        // a challenge answers, so fall through and offer one rather than
+        // dead-ending on 403 — otherwise a client whose metered grant ran out
+        // could never buy more.
+        proofNote = verified.reason;
       }
-      satisfied = verified.satisfied;
     }
 
     const decision = await this.opts.evaluate(ctx, satisfied);
@@ -252,7 +285,13 @@ export class CrapServer {
     }
 
     const challenge = await this.issue(ctx, decision, round);
-    return { kind: 'respond', response: this.challengeResponse(ctx, challenge, decision.detail) };
+    // Keep the reason the presented proof was not honoured: without it,
+    // "expired", "exhausted" and "bound to another URI" are indistinguishable
+    // to a client trying to work out what it did wrong.
+    const detail = proofNote
+      ? `${decision.detail ?? 'Requirements not satisfied.'} (the proof you presented was not honoured: ${proofNote})`
+      : decision.detail;
+    return { kind: 'respond', response: this.challengeResponse(ctx, challenge, detail) };
   }
 
   /** Is this a POST to a challenge transaction resource? */
@@ -313,6 +352,7 @@ export class CrapServer {
         grant: {
           scope: this.opts.grantScope,
           duration_seconds: this.opts.proofTtlSeconds,
+          request_limit: this.opts.grantRequestLimit ?? null,
           ...(this.opts.grantDescription ? { description: this.opts.grantDescription } : {}),
         },
       },
@@ -485,6 +525,8 @@ export class CrapServer {
       answers: satisfied.answers,
       declined: satisfied.declined,
       expiresAt,
+      maxUses: this.opts.grantRequestLimit ?? null,
+      uses: 0,
     });
 
     if (this.opts.proofMode === 'opaque') {
@@ -547,6 +589,13 @@ export class CrapServer {
     });
     if (presented !== record.scopeHash) {
       return { ok: false, reason: await this.scopeMismatchReason(record, ctx) };
+    }
+
+    // Metered grants are spent here, after every other check passes, so a
+    // rejected request never costs the client one of its paid reads.
+    if (this.opts.decisions.spend) {
+      const spent = await this.opts.decisions.spend(decisionId);
+      if (!spent.ok) return { ok: false, reason: 'grant exhausted' };
     }
 
     return {

@@ -133,6 +133,19 @@ export interface InputRequest {
   /** Stable within an issuer; the key the answer is returned under. */
   id: string;
   kind: RequestKind;
+  /**
+   * Stable, versioned URI naming the SEMANTICS of this requirement.
+   *
+   * For `task` this is load-bearing security, not metadata. A conforming
+   * client executes a task by looking this URI up in its own registry of
+   * locally-installed handlers — the handler owns the prompt, the tools and
+   * the validation. The server's `message` is never the operative
+   * instruction, so a challenge cannot manufacture new capability at runtime;
+   * it can only select among capabilities the operator already installed.
+   *
+   * A client MUST decline a task whose `type` it does not recognise.
+   */
+  type?: string;
   actor: Actor;
   interaction: Interaction;
   binding?: Binding;
@@ -222,7 +235,16 @@ export interface Challenge {
       /** `request`: this method+URI only. `origin`: anything at this origin. */
       scope: 'request' | 'origin';
       duration_seconds: number;
-      /** Optional human-readable summary, e.g. "unlimited reads for 30 min". */
+      /**
+       * How many requests the grant covers. Omitted or null means unmetered
+       * for the duration.
+       *
+       * A metered grant makes the exchange proportional: one unit of work buys
+       * a stated number of reads, so a client can compute the rate it is
+       * paying instead of guessing whether a time window is generous.
+       */
+      request_limit?: number | null;
+      /** Optional human-readable summary, e.g. "5 reads per extraction". */
       description?: string;
     };
   };
@@ -251,6 +273,30 @@ export type AnswerValue =
   | EvidenceAnswer
   | Record<string, unknown>
   | unknown[];
+
+/** Why a client refused a requirement. */
+export type DeclineCode =
+  /** The operator has not authorised task execution for this origin. */
+  | 'task-not-authorized'
+  /** The task type URI is not in the client's registry of installed handlers. */
+  | 'unknown-task-type'
+  /** Declared cost exceeds the local budget. */
+  | 'over-budget'
+  /** The requirement asked for something policy forbids disclosing. */
+  | 'disclosure-refused'
+  /** The offered grant is not worth the work. */
+  | 'insufficient-offer'
+  /** A human was asked and said no, or was unavailable. */
+  | 'approval-unavailable'
+  /** The client has no way to produce this kind of answer. */
+  | 'unsupported'
+  /** Anything else; pair with decline_reason. */
+  | 'other';
+
+export const DECLINE_CODES: DeclineCode[] = [
+  'task-not-authorized', 'unknown-task-type', 'over-budget', 'disclosure-refused',
+  'insufficient-offer', 'approval-unavailable', 'unsupported', 'other',
+];
 
 export interface ChallengeResponse {
   challenge_id: string;
@@ -524,6 +570,9 @@ export function validateChallenge(
       }
       if (!r.output_schema || typeof r.output_schema !== 'object') {
         err(`${at}/output_schema`, 'task requests must declare an output_schema');
+      }
+      if (typeof r.type !== 'string' || !/^https?:\/\//.test(r.type)) {
+        err(`${at}/type`, 'task requests must name a versioned task-type URI');
       }
       if (r.input_data) {
         if (typeof r.input_data.content !== 'string' || typeof r.input_data.media_type !== 'string') {

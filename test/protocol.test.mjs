@@ -16,6 +16,7 @@ import {
   ChallengeRejected,
   CrapError,
   extractChallenge,
+  createProofStore,
   parseAcceptInputRequired,
   clientSupportsVersion,
   HEADER_ACCEPT,
@@ -46,7 +47,7 @@ const RETENTION = {
   schema: { type: 'string', enum: ['session', 'P30D', 'indefinite'] },
 };
 
-async function boot({ evaluate, verifyEvidence, maxRounds, proofMode, grantScope, grantDescription } = {}) {
+async function boot({ evaluate, verifyEvidence, maxRounds, proofMode, grantScope, grantDescription, grantRequestLimit } = {}) {
   const served = [];
   let server;
   const http = createServer(async (req, res) => {
@@ -80,6 +81,7 @@ async function boot({ evaluate, verifyEvidence, maxRounds, proofMode, grantScope
     ...(maxRounds ? { maxRounds } : {}),
     ...(proofMode ? { proofMode } : {}),
     ...(grantScope ? { grantScope } : {}),
+    ...(grantRequestLimit !== undefined ? { grantRequestLimit } : {}),
     ...(grantDescription ? { grantDescription } : {}),
   });
 
@@ -278,23 +280,26 @@ test('a proof is bound to method, target and principal', async (t) => {
   const { proof } = await earnProof(app.origin);
   assert.ok(proof);
 
+  // A proof presented for something it does not cover must not grant access.
+  // The server re-challenges rather than dead-ending, and says why the proof
+  // was not honoured.
   const wrongMethod = await fetch(`${app.origin}/v1/records`, {
     method: 'DELETE',
     headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(wrongMethod.status, 403);
+  assert.notEqual(wrongMethod.status, 200, 'a GET proof must not open DELETE');
   assert.match((await wrongMethod.json()).detail, /method mismatch/);
 
   const wrongTarget = await fetch(`${app.origin}/v1/other-records`, {
     headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(wrongTarget.status, 403);
+  assert.notEqual(wrongTarget.status, 200, 'a proof must not leak to another target');
   assert.match((await wrongTarget.json()).detail, /target mismatch/);
 
   const wrongPrincipal = await fetch(`${app.origin}/v1/records`, {
     headers: { 'input-proof': proof, 'x-principal': 'someone-else', [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(wrongPrincipal.status, 403);
+  assert.notEqual(wrongPrincipal.status, 200, 'a proof must not transfer to another principal');
   assert.match((await wrongPrincipal.json()).detail, /principal mismatch/);
 });
 
@@ -314,7 +319,7 @@ test('content presence is bound in both directions', async (t) => {
     method: 'POST',
     headers: { 'input-proof': withBody.proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(strippedBody.status, 403, 'dropping the body must invalidate the proof');
+  assert.notEqual(strippedBody.status, 200, 'dropping the body must invalidate the proof');
   assert.match((await strippedBody.json()).detail, /content/);
 
   const differentBody = await fetch(`${app.origin}/v1/search`, {
@@ -322,7 +327,7 @@ test('content presence is bound in both directions', async (t) => {
     headers: { 'input-proof': withBody.proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
     body: JSON.stringify({ q: 'something else entirely' }),
   });
-  assert.equal(differentBody.status, 403, 'swapping the body must invalidate the proof');
+  assert.notEqual(differentBody.status, 200, 'swapping the body must invalidate the proof');
 
   // Proof earned on a POST WITHOUT a body must not work once a body is added.
   const withoutBody = await earnProof(app.origin, { path: '/v1/search', method: 'POST' });
@@ -331,7 +336,7 @@ test('content presence is bound in both directions', async (t) => {
     headers: { 'input-proof': withoutBody.proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
     body: JSON.stringify({ q: 'smuggled' }),
   });
-  assert.equal(bodyAdded.status, 403, 'adding a body must invalidate the proof');
+  assert.notEqual(bodyAdded.status, 200, 'adding a body must invalidate the proof');
   assert.match((await bodyAdded.json()).detail, /content/);
 
   // The matching retry still works.
@@ -351,7 +356,7 @@ test('query strings are bound verbatim, not canonicalised', async (t) => {
   const reordered = await fetch(`${app.origin}/v1/records?a=1&b=2`, {
     headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(reordered.status, 403, 'reordering params changes the effective URI');
+  assert.notEqual(reordered.status, 200, 'reordering params changes the effective URI');
 
   const exact = await fetch(`${app.origin}/v1/records?b=2&a=1`, {
     headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
@@ -397,7 +402,7 @@ test('a tampered proof is rejected', async (t) => {
   const attempt = await fetch(`${app.origin}/v1/records`, {
     headers: { 'input-proof': forged, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(attempt.status, 403);
+  assert.notEqual(attempt.status, 200, 'a forged proof must not grant access');
   assert.match((await attempt.json()).detail, /bad signature/);
 });
 
@@ -547,6 +552,7 @@ test('task requests are refused unless the client opted into a budget', async (t
   const TASK = {
     id: 'summary',
     kind: 'task',
+    type: 'https://example.org/tasks/summarise/v1',
     actor: 'client',
     interaction: 'inline',
     message: 'Summarise what you are about to retrieve, in 50 words.',
@@ -576,6 +582,7 @@ test('a task with no declared limits is rejected as unbounded', async (t) => {
       inputRequired([{
         id: 'work',
         kind: 'task',
+        type: 'https://example.org/tasks/unbounded/v1',
         actor: 'client',
         interaction: 'inline',
         message: 'Do some unspecified amount of work.',
@@ -696,7 +703,7 @@ test('an origin grant buys the origin, and says so on the challenge', async (t) 
   const otherPrincipal = await fetch(`${app.origin}/v1/records`, {
     headers: { 'input-proof': proof, 'x-principal': 'someone-else', [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(otherPrincipal.status, 403, 'still bound to the principal');
+  assert.notEqual(otherPrincipal.status, 200, 'still bound to the principal');
 });
 
 test('a request grant still binds to the exact request', async (t) => {
@@ -706,5 +713,100 @@ test('a request grant still binds to the exact request', async (t) => {
   const elsewhere = await fetch(`${app.origin}/v1/other`, {
     headers: { 'input-proof': proof, [HEADER_ACCEPT]: ACCEPT_VALUE },
   });
-  assert.equal(elsewhere.status, 403, 'default grant must not leak to other paths');
+  assert.notEqual(elsewhere.status, 200, 'default grant must not leak to other paths');
+});
+
+test('a task with no type URI is rejected: a challenge cannot name work generically', async (t) => {
+  const app = await boot({
+    evaluate: () =>
+      inputRequired([{
+        id: 'work',
+        kind: 'task',
+        actor: 'client',
+        interaction: 'inline',
+        message: 'Do a thing.',
+        required: true,
+        limits: { max_duration_ms: 1000 },
+        output_schema: { type: 'string' },
+      }]),
+  });
+  t.after(() => app.close());
+
+  await assert.rejects(
+    crapFetch(`${app.origin}/v1/records`, { taskBudgetMs: 60000, resolver: { task: () => answer('x') } }),
+    (err) => err instanceof ChallengeRejected && /task-type URI/.test(JSON.stringify(err.detail)),
+  );
+});
+
+test('an earned origin grant is spent on later requests instead of paying twice', async (t) => {
+  const app = await boot({
+    evaluate: (ctx, satisfied) => (satisfied ? allow() : inputRequired([PURPOSE])),
+    grantScope: 'origin',
+    grantDescription: 'the whole origin for 30 minutes',
+  });
+  t.after(() => app.close());
+
+  // A store scoped to this test, so the process-wide default cannot leak in.
+  const store = createProofStore();
+  const challenges = [];
+  const opts = {
+    resolver: staticResolver({ purpose: 'academic_research' }),
+    proofStore: store,
+    onChallenge: (c) => challenges.push(c.id),
+  };
+
+  for (const path of ['/v1/records', '/v1/other', '/v1/third']) {
+    const res = await crapFetch(`${app.origin}${path}`, opts);
+    assert.equal(res.status, 200, `${path} should be served`);
+  }
+
+  assert.equal(challenges.length, 1,
+    `paid once, then reused the grant — got ${challenges.length} challenges`);
+});
+
+test('a request-scoped grant is NOT reused elsewhere', async (t) => {
+  const app = await boot({ evaluate: (ctx, s) => (s ? allow() : inputRequired([PURPOSE])) });
+  t.after(() => app.close());
+
+  const store = createProofStore();
+  const challenges = [];
+  const opts = {
+    resolver: staticResolver({ purpose: 'academic_research' }),
+    proofStore: store,
+    onChallenge: (c) => challenges.push(c.id),
+  };
+
+  await crapFetch(`${app.origin}/v1/records`, opts);
+  await crapFetch(`${app.origin}/v1/different`, opts);
+  assert.equal(challenges.length, 2, 'a request grant must not cover another path');
+});
+
+test('a metered grant buys exactly the stated number of reads', async (t) => {
+  const app = await boot({
+    evaluate: (ctx, satisfied) => (satisfied ? allow() : inputRequired([PURPOSE])),
+    grantScope: 'origin',
+    grantRequestLimit: 5,
+    grantDescription: '5 reads per extraction',
+  });
+  t.after(() => app.close());
+
+  const res = await fetch(`${app.origin}/v1/records`, { headers: { [HEADER_ACCEPT]: ACCEPT_VALUE } });
+  const { challenge } = await res.json();
+  assert.equal(challenge.continuation.grant.request_limit, 5, 'the meter is advertised');
+
+  const store = createProofStore();
+  const challenges = [];
+  const opts = {
+    resolver: staticResolver({ purpose: 'academic_research' }),
+    proofStore: store,
+    onChallenge: (c) => challenges.push(c.id),
+  };
+
+  // Six reads on a five-read grant: the sixth must cost another extraction.
+  for (let i = 0; i < 6; i += 1) {
+    const r = await crapFetch(`${app.origin}/v1/page-${i}`, opts);
+    assert.equal(r.status, 200, `read ${i + 1} should be served`);
+  }
+  assert.equal(challenges.length, 2,
+    `5 reads per toll means 6 reads costs 2 tolls — got ${challenges.length}`);
 });
