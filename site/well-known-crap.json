@@ -1,0 +1,17 @@
+{
+  "protocol": "crap",
+  "version": 1,
+  "problem_type": "https://crap.donto.org/problems/input-required",
+  "response_media_type": "application/crap-response+json",
+  "status_code": 430,
+  "compatibility_status_code": 403,
+  "fields": {
+    "capability": "Accept-Input-Required",
+    "proof": "Input-Proof",
+    "challenge_id": "Challenge-Id"
+  },
+  "modes": ["form", "proof", "approval", "url"],
+  "assurance_levels": ["A0", "A1", "A2", "A3", "A4"],
+  "spec": "https://crap.donto.org/spec.html",
+  "source": "https://github.com/thomasdavis/crap"
+}
