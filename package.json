@@ -1,0 +1,26 @@
+{
+  "name": "crap-protocol",
+  "private": true,
+  "version": "0.1.0",
+  "description": "CRAP \u2014 Conditional Resource Access Protocol. HTTP 430 Input Required: let a resource ask an agent questions before deciding.",
+  "type": "module",
+  "workspaces": [
+    "packages/schema",
+    "packages/server",
+    "packages/client"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "example": "node examples/demo.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thomasdavis/crap.git"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^5.9.2"
+  }
+}
