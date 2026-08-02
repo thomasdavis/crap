@@ -243,6 +243,16 @@ export interface ChallengeResponse {
   input_responses: Record<string, AnswerValue>;
   /** Ids the client refuses to answer. Declining is a first-class outcome. */
   declined?: string[];
+  /**
+   * Optional, human-readable reason for declining.
+   *
+   * A server learns nothing from an agent that simply disappears, and an agent
+   * that refuses usually has a specific objection — the ask was too expensive,
+   * it looked like data exfiltration, the operator had not authorised it. This
+   * field turns a silent walkaway into feedback. It is never required, and a
+   * server MUST NOT make access conditional on supplying one.
+   */
+  decline_reason?: string;
 }
 
 /* ------------------------------------------------------------------ *
