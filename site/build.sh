@@ -19,7 +19,9 @@ render() { # <src.md> <dest.html> <title>
 }
 
 render "$REPO/README.md" "$OUT/index.html" "CRAP — Conditional Resource Access Protocol"
-render "$REPO/SPEC.md"   "$OUT/spec.html"   "CRAP v0.1 — Specification"
+render "$REPO/SPEC.md"   "$OUT/spec.html"   "CRAP v0.2 — Specification"
+render "$REPO/FINDINGS.md" "$OUT/findings.html" \
+  "CRAP in production — what happened when we asked agents to pay"
 
 # The problem type URI must resolve to something that explains it (RFC 9457).
 render "$REPO/site/problem-input-required.md" "$OUT/problems/input-required.html" \
