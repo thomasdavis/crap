@@ -1,5 +1,5 @@
 {
-  "name": "@crap-protocol/server",
+  "name": "@thomasdavis/crap-server",
   "version": "0.1.0",
   "description": "CRAP (Conditional Resource Access Protocol) \u2014 server",
   "type": "module",
@@ -25,6 +25,9 @@
     "directory": "packages/server"
   },
   "dependencies": {
-    "@crap-protocol/schema": "^0.1.0"
+    "@thomasdavis/crap-schema": "^0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

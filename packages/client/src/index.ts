@@ -1,5 +1,5 @@
 /**
- * @crap-protocol/client — a fetch wrapper that answers challenges.
+ * @thomasdavis/crap-client — a fetch wrapper that answers challenges.
  *
  * The design rule: the SERVER asks, the CLIENT decides. A resolver you supply
  * decides what may be answered autonomously, what needs a human, and what is
@@ -23,9 +23,9 @@ import {
   type Challenge,
   type ChallengeResponse,
   type InputRequest,
-} from '@crap-protocol/schema';
+} from '@thomasdavis/crap-schema';
 
-export * from '@crap-protocol/schema';
+export * from '@thomasdavis/crap-schema';
 
 /** What a resolver may return for one question. */
 export type Answer =

@@ -23,14 +23,14 @@ is a provisional squat on an unassigned code. See [SPEC.md](./SPEC.md).
 ## Install
 
 ```bash
-npm install @crap-protocol/server   # protecting a resource
-npm install @crap-protocol/client   # calling one
+npm install @thomasdavis/crap-server   # protecting a resource
+npm install @thomasdavis/crap-client   # calling one
 ```
 
 ## Server
 
 ```js
-import { CrapServer, allow, inputRequired } from '@crap-protocol/server';
+import { CrapServer, allow, inputRequired } from '@thomasdavis/crap-server';
 
 const crap = new CrapServer({
   issuer: 'https://data.example',
@@ -73,7 +73,7 @@ app.use('/v1/records', crapMiddleware(crap, { origin: 'https://data.example' }))
 ## Client
 
 ```js
-import { crapFetch, answer, decline } from '@crap-protocol/client';
+import { crapFetch, answer, decline } from '@thomasdavis/crap-client';
 
 const res = await crapFetch('https://data.example/v1/records', {
   resolver: {

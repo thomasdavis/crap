@@ -1,5 +1,5 @@
 {
-  "name": "@crap-protocol/client",
+  "name": "@thomasdavis/crap-client",
   "version": "0.1.0",
   "description": "CRAP (Conditional Resource Access Protocol) \u2014 client",
   "type": "module",
@@ -25,6 +25,9 @@
     "directory": "packages/client"
   },
   "dependencies": {
-    "@crap-protocol/schema": "^0.1.0"
+    "@thomasdavis/crap-schema": "^0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

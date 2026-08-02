@@ -1,5 +1,5 @@
 /**
- * @crap-protocol/server — issue challenges, validate answers, mint scoped proofs.
+ * @thomasdavis/crap-server — issue challenges, validate answers, mint scoped proofs.
  *
  * Transport-neutral core plus a thin Node `http` adapter. The core knows
  * nothing about frameworks: you hand it a description of the request and it
@@ -27,9 +27,9 @@ import {
   type InputRequest,
   type ProblemDocument,
   type ValidationError,
-} from '@crap-protocol/schema';
+} from '@thomasdavis/crap-schema';
 
-export * from '@crap-protocol/schema';
+export * from '@thomasdavis/crap-schema';
 
 /** The request, reduced to what a policy decision actually needs. */
 export interface RequestContext {

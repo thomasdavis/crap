@@ -11,7 +11,7 @@ import {
   allow,
   deny,
   inputRequired,
-} from '@crap-protocol/server';
+} from '@thomasdavis/crap-server';
 import {
   crapFetch,
   staticResolver,
@@ -23,7 +23,7 @@ import {
   HEADER_ACCEPT,
   ACCEPT_VALUE,
   PROBLEM_TYPE,
-} from '@crap-protocol/client';
+} from '@thomasdavis/crap-client';
 
 const SECRET = 'test-secret-do-not-ship';
 

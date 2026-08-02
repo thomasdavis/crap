@@ -3,8 +3,8 @@
  * with three different postures. Run: npm run example
  */
 import { createServer } from 'node:http';
-import { CrapServer, allow, deny, inputRequired } from '@crap-protocol/server';
-import { crapFetch, answer, decline, ChallengeDeclined } from '@crap-protocol/client';
+import { CrapServer, allow, deny, inputRequired } from '@thomasdavis/crap-server';
+import { crapFetch, answer, decline, ChallengeDeclined } from '@thomasdavis/crap-client';
 
 const QUESTIONS = [
   {
