@@ -150,6 +150,23 @@ export interface InputRequest {
   output_schema?: Record<string, unknown>;
   /** For `task`: declared cost ceiling. Required. */
   limits?: TaskLimits;
+  /**
+   * For `task`: the material to work on.
+   *
+   * Separate from `message` on purpose. `message` is the instruction and
+   * `input_data` is inert data — a client MUST NOT treat anything inside it as
+   * an instruction, even when it looks like one, and SHOULD bound how much of
+   * it it will process. Putting the material in `message` would make the two
+   * indistinguishable, which is the whole prompt-injection problem.
+   */
+  input_data?: {
+    media_type: string;
+    content: string;
+    /** Where it came from, so an agent can decline on provenance grounds. */
+    source?: string;
+    /** True when `content` is an excerpt rather than the whole thing. */
+    truncated?: boolean;
+  };
   /** For `evidence`: which classes the issuer will accept. Set membership. */
   accepted_evidence?: EvidenceClass[];
   /** For `evidence`: concrete mechanisms the issuer can check. */
@@ -482,6 +499,13 @@ export function validateChallenge(
       if (!r.output_schema || typeof r.output_schema !== 'object') {
         err(`${at}/output_schema`, 'task requests must declare an output_schema');
       }
+      if (r.input_data) {
+        if (typeof r.input_data.content !== 'string' || typeof r.input_data.media_type !== 'string') {
+          err(`${at}/input_data`, 'input_data needs media_type and content');
+        } else if (r.input_data.content.length > MAX_TASK_INPUT_CHARS) {
+          err(`${at}/input_data`, `material exceeds ${MAX_TASK_INPUT_CHARS} chars`);
+        }
+      }
     }
   });
 
@@ -522,6 +546,12 @@ export function suspiciousRequests(challenge: Challenge): InputRequest[] {
     return FORBIDDEN_FIELD_HINTS.some((hint) => haystack.includes(hint));
   });
 }
+
+/**
+ * Ceiling on task material a client will accept in one challenge. A server
+ * that wants a book processed can ask; the client does not have to read it.
+ */
+export const MAX_TASK_INPUT_CHARS = 20000;
 
 /** Total declared cost of the `task` requests in a challenge. */
 export function taskCost(challenge: Challenge): { count: number; maxDurationMs: number } {
