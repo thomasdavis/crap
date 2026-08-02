@@ -1,13 +1,22 @@
 # CRAP: Conditional Resource Access Protocol
 
-**Version:** 0.1 (experimental)
+**Version:** 0.2 (experimental)
 **Status:** working draft, no IANA registrations, breaking changes expected
-**Provisional status code:** `430 Input Required`
+**Normative baseline:** `403` + `application/problem+json`
+**Optional negotiated profile:** `430 Input Required` (provisional squat)
 **Problem type:** `https://crap.donto.org/problems/input-required`
 **Response media type:** `application/crap-response+json`
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be interpreted
 as described in RFC 2119.
+
+> **Changes from 0.1.** The `mode` enum split into independent facets (`kind`,
+> `actor`, `interaction`, `binding`), because form/proof/approval/url were not
+> peers. The A0–A4 assurance ladder became unordered evidence classes, because
+> it is not a total order. Answers submit to a dedicated transaction resource,
+> not the protected resource. Continuation proofs are opaque and carry no
+> answer values. Content presence is bound in both directions. Targets are
+> compared verbatim. `pattern` and `format` left the schema subset.
 
 ---
 
@@ -15,42 +24,52 @@ as described in RFC 2119.
 
 An origin server MAY respond to an otherwise-valid request with a
 **challenge**: a machine-readable set of **input requests** the client must
-satisfy before the request can be processed. The client submits **answers**,
-receives a scoped **continuation proof**, and retries the original request.
+satisfy before the request can be processed. The client submits **answers** to
+a challenge transaction resource, receives a scoped **continuation proof**, and
+retries the original request.
 
-The protocol is a carrier. It defines how questions and answers travel, how
-they are bound to a request, and how much an answer is worth. It does not
-define what may be asked — that is the application's business.
+The protocol is a carrier. It defines how requirements and answers travel, how
+they bind to a request, and how an accepted answer's provenance is recorded. It
+does not define what may be asked — that is the application's business.
 
 ```
-  Client                                  Server
-    │                                        │
-    │ GET /resource                          │
-    │ Accept-Input-Required: v=1             │
-    │───────────────────────────────────────▶│
-    │                                        │  policy: input_required
-    │ 430 Input Required                     │
-    │ problem+json { challenge }             │
-    │◀───────────────────────────────────────│
-    │                                        │
-    │ POST /resource                         │
+  Client                                     Server
+    │                                           │
+    │ GET /records                              │
+    │ Accept-Input-Required: v=2                │
+    │──────────────────────────────────────────▶│  policy: input_required
+    │ 430 Input Required  (or 403, §3)          │
+    │ problem+json { challenge }                │
+    │◀──────────────────────────────────────────│
+    │                                           │
+    │ POST /.well-known/input-challenges/{id}/responses
     │ Content-Type: application/crap-response+json
-    │ { challenge_id, request_state, answers }│
-    │───────────────────────────────────────▶│  validate + grade + consume
-    │ 204 No Content                         │
-    │ Input-Proof: <scoped proof>            │
-    │◀───────────────────────────────────────│
-    │                                        │
-    │ GET /resource                          │
-    │ Input-Proof: <scoped proof>            │
-    │───────────────────────────────────────▶│  verify binding
-    │ 200 OK                                 │
-    │◀───────────────────────────────────────│
+    │ { challenge_id, request_state, answers }   │
+    │──────────────────────────────────────────▶│  validate, verify, consume
+    │ 204 No Content                            │
+    │ Input-Proof: ip1.<opaque handle>          │
+    │◀──────────────────────────────────────────│
+    │                                           │
+    │ GET /records                              │
+    │ Input-Proof: ip1.<opaque handle>          │
+    │──────────────────────────────────────────▶│  verify binding
+    │ 200 OK                                    │
+    │◀──────────────────────────────────────────│
 ```
 
 ## 2. Status codes
 
-### 2.1 `430 Input Required` (provisional)
+### 2.1 The baseline is `403`
+
+The normative v0.2 wire format is a `403 Forbidden` carrying
+`application/problem+json` with the CRAP problem type. Clients MUST detect a
+challenge by the problem `type`, never by the status code.
+
+This is the durable part of the protocol: the problem type, the challenge
+document, submission semantics, request binding, the continuation proof, and
+the client's right to refuse. The status code is only a dispatch convenience.
+
+### 2.2 `430 Input Required` (provisional, optional)
 
 > The origin server understands the request and MAY be willing to process it,
 > but requires the client to satisfy one or more application-level input
@@ -59,48 +78,51 @@ define what may be asked — that is the application's business.
 > request.
 
 `430` is unassigned in the IANA HTTP Status Code Registry at the time of
-writing. This document squats on it provisionally. A server MUST NOT return
-`430` unless the client advertised support (§3.1).
+writing; this document squats on it provisionally. A server MUST NOT return
+`430` unless the client advertised support (§3.1). Nothing in this protocol
+depends on `430` being registered.
 
-`430` is not cacheable by default and MUST be sent with `Cache-Control: no-store`.
+Both profiles MUST be sent with `Cache-Control: no-store` and
+`Vary: Accept-Input-Required`.
 
-### 2.2 Choosing the right status
+### 2.3 Choosing the right status
 
 | Condition | Status |
 |---|---|
 | Credentials absent, invalid, or insufficient | `401` |
-| Payment required | `402` |
+| Payment required (`402` is reserved; concrete schemes profile it) | `402` |
 | Final policy decision; more input will not help | `403` |
 | Request conflicts with resource state | `409` |
 | The submitted representation is itself invalid | `422` |
 | Client must slow down | `429` |
-| Recoverable, application-defined input needed | `430` |
+| Recoverable, application-defined input needed | `403` + problem type, or `430` |
 
-A server MUST NOT use `430` when it has already decided to refuse. `430` is a
-promise that an answer exists which would change the outcome.
+A server MUST NOT issue a challenge when it has already decided to refuse. A
+challenge is a promise that an answer exists which would change the outcome.
 
 ## 3. Capability negotiation
 
 ### 3.1 `Accept-Input-Required`
 
-A client that understands this protocol SHOULD send:
+A client that understands this protocol SHOULD send an RFC 9651 structured
+dictionary:
 
 ```
-Accept-Input-Required: v=1
+Accept-Input-Required: v=2
 ```
 
-A server MUST NOT respond `430` to a request lacking this field. Instead it
-uses the compatibility profile.
+Servers MUST parse this as a structured field and compare the integer exactly.
+A substring test is non-conforming: `v=20` does not indicate support for
+version 2.
+
+A server MUST NOT respond `430` to a request lacking a matching version.
 
 ### 3.2 Compatibility profile
 
-When the client has not opted in, the server sends the identical problem
-document with status `403`. Clients detect a challenge by the problem `type`,
-not by the status code. Both profiles are otherwise byte-identical.
-
-This exists because unknown 4xx codes are treated as `400` by RFC 9110 §15.5,
-and because intermediaries, SDKs and API gateways in the wild do not all
-tolerate unregistered codes.
+When the client has not opted in, the server sends the same problem document
+with status `403`. The two profiles are semantically identical but NOT
+byte-identical: RFC 9457 §3.1 requires the `status` member to match the actual
+HTTP status, so it is `403` in one and `430` in the other.
 
 ## 4. The challenge
 
@@ -110,12 +132,12 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
 {
   "type": "https://crap.donto.org/problems/input-required",
   "title": "Input Required",
-  "status": 430,
-  "detail": "This resource has questions that must be answered before it can be served.",
+  "status": 403,
+  "detail": "This resource requires additional input before it can be served.",
   "instance": "https://data.example/v1/records",
   "challenge": {
     "id": "ch_zC4mV8xQ",
-    "version": 1,
+    "version": 2,
     "issuer": "https://data.example",
     "issued_at": "2026-08-02T00:00:00Z",
     "expires_at": "2026-08-02T00:15:00Z",
@@ -123,13 +145,13 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
     "scope": {
       "method": "GET",
       "target": "https://data.example/v1/records",
-      "request_digest": "sha-256=:n4bQgYhMfWWaLq…:",
+      "has_content": false,
       "principal": "acct:agent-7"
     },
     "input_requests": [ … ],
     "submission": {
       "method": "POST",
-      "target": "https://data.example/v1/records",
+      "target": "https://data.example/.well-known/input-challenges/ch_zC4mV8xQ/responses",
       "content_type": "application/crap-response+json"
     },
     "continuation": { "mode": "retry-original-request" },
@@ -144,29 +166,35 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
 | Member | Req | Meaning |
 |---|---|---|
 | `id` | ✔ | Unique challenge identifier. |
-| `version` | ✔ | Protocol version. `1`. |
-| `issuer` | ✔ | Origin that issued it. Proofs are only valid at this origin. |
+| `version` | ✔ | Protocol version. `2`. |
+| `issuer` | ✔ | Origin that issued it. MUST equal the responding origin (§7.2). |
 | `issued_at` / `expires_at` | ✔ | RFC 3339 timestamps. |
 | `request_state` | ✔ | Opaque server value; the client MUST echo it. Nonce material. |
-| `scope` | ✔ | The request this challenge is bound to (§6.1). |
-| `input_requests` | ✔ | One or more questions. |
-| `submission` | ✔ | Where and how to send answers. |
+| `scope` | ✔ | The request this challenge binds to (§6.1). |
+| `input_requests` | ✔ | One or more requirements. |
+| `submission` | ✔ | The transaction resource (§6.2). |
 | `continuation` | ✔ | `retry-original-request` or `complete-on-submit`. |
-| `max_rounds` / `round` | ✔ | Loop bound (§6.4). |
+| `max_rounds` / `round` | ✔ | Loop bound (§6.5). |
 | `policy_version` | | Which version of the issuer's policy produced this. |
 
 ### 4.2 Input requests
 
+A requirement is described by four independent facets. v0.1 used a single
+`mode` enum whose members were not peers — `form` described a representation,
+`proof` an evidence class, `approval` a decider, `url` a delivery channel — so
+OAuth (out-of-band, user-mediated, evidence-producing) could not be expressed.
+
 ```json
 {
   "id": "purpose",
-  "mode": "form",
+  "kind": "declaration",
+  "actor": "client",
+  "interaction": "inline",
   "message": "What is this data for?",
   "reason": "The collection has purpose-specific access conditions.",
   "required": true,
   "sensitivity": "internal",
   "retention": "P1Y",
-  "min_assurance": "A0",
   "schema": {
     "type": "string",
     "enum": ["academic_research", "commercial_product", "model_training"]
@@ -174,83 +202,158 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
 }
 ```
 
+| Facet | Values | Question it answers |
+|---|---|---|
+| `kind` | `declaration` \| `evidence` \| `approval` \| `task` | What is being asked for? |
+| `actor` | `client` \| `user` \| `organization` \| `third_party` | Who must produce it? |
+| `interaction` | `inline` \| `out_of_band` | Does it pass through the agent? |
+| `binding` | `none` \| `client_key` \| `user_identity` \| `organization_identity` | What is it tied to? |
+
+Which composes the cases that mattered:
+
+| Requirement | kind | actor | interaction | binding |
+|---|---|---|---|---|
+| Purpose of use | declaration | client | inline | none |
+| Human confirmation | approval | user | out_of_band | user_identity |
+| OAuth delegation | evidence | user | out_of_band | user_identity |
+| Verifiable credential | evidence | third_party | inline | organization_identity |
+| Work as toll (§5.4) | task | client | inline | none |
+
+Other members:
+
 | Member | Req | Meaning |
 |---|---|---|
-| `id` | ✔ | Key the answer is returned under. Unique within a challenge. |
-| `mode` | ✔ | `form` \| `proof` \| `approval` \| `url` (§5). |
+| `id` | ✔ | Key the answer returns under. Unique within a challenge. |
 | `message` | ✔ | Human-readable prompt. **Untrusted text** (§7.1). |
 | `required` | ✔ | Whether declining fails the challenge. |
 | `reason` | | Why the issuer needs it. SHOULD be present. |
-| `schema` | form | JSON Schema subset (§4.3) the answer must satisfy. |
-| `accepted_proof_types` | proof | Evidence types the issuer will consider. |
-| `url` | url | HTTPS location of the out-of-band interaction. |
-| `min_assurance` | | Lowest acceptable grade (§8). |
+| `schema` | declaration | JSON Schema subset (§4.3). |
+| `accepted_evidence` | evidence | Evidence classes accepted (§8). Set membership. |
+| `accepted_proof_types` | | Concrete mechanisms the issuer can check. |
+| `output_schema` / `limits` | task | Work product shape and cost ceiling (§5.4). |
+| `url` | out_of_band | HTTPS location of the interaction. |
 | `sensitivity` / `retention` | | Declared handling of the answer. |
 
 ### 4.3 Schema subset
 
-`form` schemas are restricted to: `type`, `enum`, `const`, `minimum`,
-`maximum`, `minLength`, `maxLength`, `pattern`, `format`, `items`, `minItems`,
-`maxItems`, `properties`, `required`, `additionalProperties`, `description`,
-`title`, `default`.
+Restricted to: `type`, `enum`, `const`, `minimum`, `maximum`, `minLength`,
+`maxLength`, `items`, `minItems`, `maxItems`, `properties`, `required`,
+`additionalProperties`, `description`, `title`, `default`.
 
 A client encountering any other keyword MUST reject the challenge rather than
-ignore the keyword. `$ref`, `allOf`/`anyOf`/`oneOf`, and remote schema loading
-are excluded deliberately: a client MUST NOT fetch a schema from the network to
-understand a question.
+ignore it. `$ref`, `allOf`/`anyOf`/`oneOf` and remote schema loading are
+excluded: a client MUST NOT fetch a schema over the network to understand a
+requirement.
 
-Implementations SHOULD bound `pattern` compilation against catastrophic
-backtracking.
+`pattern` and `format` were in the v0.1 subset and are now excluded.
+`pattern` requires compiling a stranger's regular expression, and a length cap
+does not prevent catastrophic backtracking — short expressions backtrack fine.
+An implementation wanting `pattern` MUST use a linear-time engine (RE2 or
+equivalent) and MUST declare that it does. `format` was advertised but
+unenforced in v0.1, which is worse than absent: a server could believe it had
+constrained an answer that nothing checked.
 
-## 5. Input modes
+## 5. Kinds
 
-### 5.1 `form`
+### 5.1 `declaration`
 
-Structured, non-secret data, answerable autonomously.
+A bounded statement of fact or intent, answerable by the client from its own
+policy and context. Always `self_asserted` (§8) — a declaration is a claim, and
+no amount of schema validation makes it true.
 
-A server MUST NOT request through `form` mode: passwords, API keys, access or
-refresh tokens, private keys, seed phrases, payment card data, or the client's
-own operating context (system prompt, reasoning trace, conversation history,
-environment variables, cookies).
+A server MUST NOT request, and a client MUST refuse, in-band declarations of:
+passwords, API keys, access or refresh tokens, private keys, seed phrases,
+payment card data, or the client's own operating context (system prompt,
+reasoning trace, conversation history, environment variables, cookies).
 
-Clients SHOULD refuse challenges that appear to do so and MAY report them.
+### 5.2 `evidence`
 
-### 5.2 `proof`
-
-Machine-verifiable evidence: HTTP Message Signatures (RFC 9421), OAuth
-delegation, verifiable credentials, key-possession proofs, organisational
-attestations.
+Something the server can check: HTTP Message Signatures (RFC 9421), OAuth
+delegation, verifiable credentials, key-possession proofs, attestations.
 
 The answer is `{ "proof_type": "…", "proof": "…" }`. Servers MUST verify
-proofs. An unverified proof MUST be graded A0 or rejected — never treated as
-evidence because it was labelled evidence.
+evidence and MUST assign an evidence class from verification, never from what
+the answer called itself. `accepted_evidence` MUST NOT include `self_asserted`;
+an unverifiable requirement is a `declaration`.
 
 ### 5.3 `approval`
 
-A human must approve. Clients MUST surface these outside the agent's autonomous
-path and MUST NOT allow a model to self-approve. The answer SHOULD be a signed
-approval receipt.
+A decision by a person or body. Clients MUST surface these outside the agent's
+autonomous path and MUST NOT allow a model to self-approve. The answer SHOULD
+be a signed approval receipt.
 
-### 5.4 `url`
+### 5.4 `task` (experimental)
 
-The interaction happens out of band at an HTTPS location: OAuth consent,
-identity verification, payment, legally significant acceptance. Values entered
-there never enter the agent's context.
+Work performed by the client as a condition of access — the "computational
+toll" application. It is separated from `declaration` deliberately: it has a
+different cost, abuse, fairness and denial-of-service profile, and a
+conservative client may support declarations while refusing all tasks.
+
+A `task` request MUST declare `output_schema` and `limits.max_duration_ms`. A
+client MUST reject a task with no declared limits as unbounded, and SHOULD
+refuse tasks exceeding a local budget. The reference client's default budget is
+zero: tasks are opt-in.
+
+```json
+{
+  "id": "classify",
+  "kind": "task",
+  "actor": "client",
+  "interaction": "inline",
+  "message": "Classify this document under the supplied taxonomy.",
+  "required": true,
+  "output_schema": { "type": "string", "enum": ["policy", "correspondence", "report"] },
+  "limits": { "max_duration_ms": 5000, "max_output_tokens": 500, "max_rounds": 1 },
+  "compensation": { "type": "conditional_access" }
+}
+```
+
+Servers MUST NOT treat task output as verified information. It is
+`self_asserted` output from a party with an incentive to answer quickly rather
+than correctly, and SHOULD be sampled, cross-checked or corroborated before it
+is relied upon.
+
+### 5.5 Out-of-band interaction
+
+When `interaction` is `out_of_band`, the exchange happens at `url`: OAuth
+consent, identity verification, payment, legally significant acceptance. Values
+entered there never enter the agent's context. This is the only correct place
+for anything §5.1 forbids in band.
 
 ## 6. Binding
 
-### 6.1 Scope binding
+### 6.1 Scope
 
-A challenge is bound to `scope`: method, normalised target URI, principal, and
-— when a body is present — a digest of it. A server MUST reject a submission
-whose request context does not match the scope of the challenge being answered.
+A challenge binds to: method, the **exact effective request URI**, content
+presence, content digest when present, and principal.
 
-Targets are compared after normalisation: query parameters sorted, fragment
-removed, default ports elided.
+Targets are compared **verbatim**. Implementations MUST NOT canonicalise the
+query — sorting parameters changes application semantics for repeated
+parameters and for APIs where order is meaningful. Where finer-grained
+component coverage is wanted, use the derived components of RFC 9421 rather
+than inventing a canonicalisation rule.
+
+`scope.has_content` states whether the bound request carried content, and MUST
+be bound in both directions:
+
+```
+proof has content  ⇔  retried request has content
+```
+
+A proof minted for a request with a body MUST NOT be presentable on one
+without, and vice versa. When content is present, `scope.content_digest`
+carries the RFC 9530 `Content-Digest` value and MUST match.
 
 ### 6.2 Submission
 
-The client POSTs `application/crap-response+json` to `submission.target`:
+Answers are POSTed to a challenge transaction resource, NOT to the protected
+resource — protocol answers otherwise collide with the resource's own `POST`
+semantics and force middleware to discriminate by content type.
+
+```
+POST /.well-known/input-challenges/{challenge_id}/responses
+Content-Type: application/crap-response+json
+```
 
 ```json
 {
@@ -262,139 +365,172 @@ The client POSTs `application/crap-response+json` to `submission.target`:
 }
 ```
 
-The server MUST reject the submission if: the challenge is unknown or expired;
-`request_state` does not match; the principal differs; the target differs; a
-required input is missing or declined; any answer fails its schema; any answer
-falls below `min_assurance`; or the challenge has already been consumed.
+`submission.target` MUST be same-origin with `issuer`. A client MUST reject a
+cross-origin submission target unless it holds an explicit, separately
+authenticated delegation permitting it; an `https` scheme is not sufficient.
+Without this, a challenge can direct a client's declarations to an origin that
+never asked for them.
 
-Schema failures return `422` with a machine-readable `errors` array. Everything
-else returns `403`.
+The server MUST reject the submission if: the challenge is unknown, expired, or
+already consumed; the id in the path differs from the body; `request_state`
+does not match; the principal differs; a required input is missing or declined;
+any answer fails its schema; or any evidence class is not in
+`accepted_evidence`. Schema failures return `422` with a machine-readable
+`errors` array; everything else returns `403`.
 
 On success: `204 No Content` with an `Input-Proof` header.
 
 ### 6.3 Continuation proof
 
-The `Input-Proof` value is opaque to the client. It MUST be bound to at least:
-issuing origin, method, normalised target, principal, body digest (when
-applicable), round, and an expiry. It SHOULD be short-lived (minutes) and
-SHOULD be sender-constrained where the client has a key.
+`Input-Proof` is opaque to the client. It MUST bind: issuing origin, method,
+exact target, content presence and digest, principal, round, and an expiry. It
+SHOULD be short-lived (minutes) and SHOULD be sender-constrained where the
+client has a key.
 
-A proof MUST NOT be usable:
-- at another origin,
-- for another method or target,
-- by another principal,
-- after expiry,
-- more than the issuer permits.
+A proof MUST NOT carry answer values. Headers are logged by servers, proxies
+and telemetry pipelines; purpose, retention and delegation metadata do not
+belong there, and large answers break header size limits. Two profiles:
 
-A proof is not a session token and MUST NOT be accepted in place of
-authentication.
+- **`ip1` (opaque, default)** — a random handle; the decision, answers and
+  scope hash live server-side.
+- **`ip2` (stateless)** — a signed token carrying a decision id, scope hash and
+  a **digest** of the answers. Still no values.
 
-### 6.4 Rounds
+A proof MUST NOT be usable at another origin, for another method, target or
+content, by another principal, or after expiry. A proof is not a session token
+and MUST NOT be accepted in place of authentication.
 
-A server MAY issue a further challenge after a successful submission (e.g. the
-answers revealed a new obligation). `round` increments; when it would exceed
-`max_rounds` the server MUST return a final `403` instead. Default cap: 3.
+### 6.4 Idempotency
 
-Clients MUST independently cap the number of rounds they will play.
+Answering a challenge MUST be single-use. Retrying the original request with a
+valid unexpired proof is not a replay and MAY be repeated until expiry.
 
-### 6.5 Idempotency
+### 6.5 Rounds
 
-Answering a challenge MUST be single-use. A replayed submission MUST be
-rejected. Retrying the original request with a valid, unexpired proof is not a
-replay and MAY be repeated until the proof expires.
+A server MAY issue a further challenge after a successful submission.
+`round` increments; when it would exceed `max_rounds` the server MUST return a
+final `403`. Default cap 3. Clients MUST independently cap rounds.
 
 ## 7. Security considerations
 
 ### 7.1 Challenges are attacker-controlled input
 
 `message` and `reason` are remote text delivered into an agent's execution
-context. This is a prompt-injection surface, and CRAP makes it a first-class
-one: any server can now put arbitrary prose in front of any agent.
-
-Clients MUST treat challenge text as data. An agent MUST fill only declared
-fields, per its own policy, and MUST NOT act on instructions embedded in
-challenge text. Client policy MUST override server request in all cases.
+context, and this protocol lets any server put arbitrary prose in front of any
+agent. Clients MUST treat challenge text as data, MUST fill only declared
+fields per their own policy, and MUST NOT act on instructions embedded in it.
+Client policy MUST override server request in all cases.
 
 Servers SHOULD assume the same in reverse: an answer is text an agent produced,
-possibly under the influence of a third party.
+possibly under a third party's influence.
 
-### 7.2 Interrogation and surveillance
+### 7.2 Challenge-to-exchange binding
 
-An open-ended question channel is an open-ended data-collection channel. Every
-input request SHOULD declare `reason`, `sensitivity` and `retention`. Clients
-MUST be able to decline any individual input and MUST be able to refuse a
-challenge entirely. Servers MUST NOT treat declining as grounds for anything
-except the `403` the client already accepted.
+Before answering, a client MUST verify that:
 
-### 7.3 Proof theft
+```
+challenge.issuer origin  == responding origin
+challenge.scope.method   == the method it sent
+challenge.scope.target   == the URI it requested
+challenge.scope.has_content == whether it sent content
+submission.target origin == challenge.issuer origin
+```
 
-Because proofs authorise a retry, a stolen proof is a stolen request — bounded
-by §6.3's binding. Implementations SHOULD sender-constrain proofs when agent
-keys are available (Web Bot Auth, RFC 9421).
+A challenge failing any of these MUST be rejected without answering.
 
-### 7.4 Cache poisoning
+### 7.3 Interrogation and surveillance
 
-Challenges, submissions and proof-bearing responses MUST be sent with
-`Cache-Control: no-store`. A challenge MUST NOT be shared between principals
-through a shared cache.
+An open-ended requirement channel is an open-ended data-collection channel.
+Requests SHOULD declare `reason`, `sensitivity` and `retention`. Clients MUST
+be able to decline any individual requirement and refuse a challenge entirely.
+Servers MUST NOT treat declining as grounds for anything beyond the `403` the
+client already accepted.
 
-### 7.5 Denial of service
+### 7.4 Proof theft
 
-Challenge issuance is cheap; validation is not. Servers SHOULD rate-limit
-submissions independently of requests, bound challenge storage, and expire
-aggressively.
+A stolen proof is a stolen request, bounded by §6.3. Sender-constrain proofs
+where agent keys exist (Web Bot Auth, RFC 9421).
 
-### 7.6 What this protocol does not do
+### 7.5 Cache safety
+
+Challenges, submissions and proof-bearing responses MUST be `Cache-Control:
+no-store`, and challenge responses MUST send `Vary: Accept-Input-Required`
+since status and representation depend on it. A challenge MUST NOT be shared
+between principals through a shared cache.
+
+### 7.6 Denial of service
+
+Issuance is cheap, verification is not. Servers SHOULD rate-limit submissions
+independently of requests, bound challenge storage, and expire aggressively.
+Clients bound the reverse risk with round caps and task budgets.
+
+### 7.7 What this protocol does not do
 
 It does not verify that declarations are true. It does not identify agents
-(that's Web Bot Auth). It does not distinguish humans from machines and MUST
-NOT be used to. It does not make an unenforceable promise enforceable.
+(Web Bot Auth does). It does not distinguish humans from machines and MUST NOT
+be used to. It does not make an unenforceable promise enforceable.
 
-## 8. Assurance levels
+## 8. Evidence classes
 
-| Level | Meaning |
+How an accepted answer was established. Deliberately **not** a total order:
+independent verification and third-party attestation answer different
+questions, and delegation is about authority rather than identity. Servers list
+what they accept; membership is checked, never rank.
+
+| Class | Meaning |
 |---|---|
-| A0 | Unverified declaration. The agent supplied a value. |
-| A1 | Signed declaration. An identified agent signed the value. |
-| A2 | Delegated claim. A user or organisation authorised it. |
-| A3 | Verifiable proof. The server verified it independently. |
-| A4 | Attestation. A recognised third party vouches for it. |
+| `self_asserted` | The client said so. All declarations and task output. |
+| `client_signed` | Signed by an identified client key. |
+| `delegated` | A user or organisation conferred the authority. |
+| `independently_verified` | The server checked it with the issuing authority. |
+| `third_party_attested` | A recognised third party vouches. |
 
-`form` answers are A0 by definition. Servers SHOULD record the assurance of
-every answer alongside the decision it produced, and SHOULD NOT make
-consequential decisions on A0 alone.
+An accepted answer carries a descriptor, not just a label:
+
+```json
+{
+  "class": "delegated",
+  "claimant": "agent-key:abc123",
+  "authority": "organization-delegation",
+  "verification": "issuer-verified",
+  "attester": null,
+  "trust_framework": "https://example.org/trust/profiles/v1"
+}
+```
+
+Servers SHOULD record the evidence descriptor alongside the decision it
+produced, and SHOULD NOT make consequential decisions on `self_asserted` alone.
 
 ## 9. Relationship to existing work
 
-| | |
+| Mechanism | Requirement expressed |
 |---|---|
-| **MCP Elicitation** | The same interaction inside MCP: schema-driven requests, URL mode, secret-handling rules. CRAP generalises it to HTTP and adds request binding, proofs and assurance. Field naming deliberately echoes it. |
-| **RFC 9457** | The challenge is a problem document. Compatibility profile depends on it. |
-| **RFC 9421** | Message signatures are the expected `proof` mechanism. |
-| **Web Bot Auth** | Stable agent identity and metadata. CRAP handles the per-request questions a static agent card can't answer. |
-| **RFC 9470** | Step-up authentication — the auth-specific special case of this shape. |
-| **x402 / `402`** | Payment — the money-specific special case. |
-| **`401` / RFC 9110** | Authentication — the credential-specific special case. |
+| `401` / `WWW-Authenticate` | Authentication credentials |
+| RFC 9470 | Stronger or more recent authentication — the same challenge/retry shape, scoped to auth |
+| `402` + payment profiles | Payment |
+| MCP elicitation | Additional input inside an MCP interaction |
+| RFC 9457 | Machine-readable description of a problem |
+| RFC 9421 / RFC 9530 | Signing and digesting HTTP messages |
+| Web Bot Auth | Stable agent identity and operator metadata |
+| **CRAP** | Application-defined, per-request requirements over HTTP |
 
 ## 10. IANA considerations
 
-Nothing is registered yet. A future version would request:
+Nothing is registered. A future version would request:
 
-1. **HTTP status code** `430 Input Required` (IETF Review).
-2. **Problem type** `https://crap.donto.org/problems/input-required` (Specification Required).
-3. **Media type** `application/crap-response+json`.
+1. **Problem type** `https://crap.donto.org/problems/input-required` (Specification Required) — the achievable near-term step.
+2. **Media type** `application/crap-response+json`.
+3. **Well-known URI** `input-challenges`.
 4. **Field names** `Accept-Input-Required`, `Input-Proof`, `Challenge-Id`.
-
-The problem-type registration is the achievable near-term step; the status code
-is not on the critical path, which is why the compatibility profile exists.
+5. **HTTP status code** `430 Input Required` (IETF Review) — explicitly not on the critical path.
 
 ## 11. Open questions
 
-Genuinely open — input wanted:
+Genuinely open — input wanted.
 
 1. **Cross-origin proofs.** Should an answer given to one origin be reusable at another that trusts it? Useful, and a tracking vector.
-2. **Standing answers.** A way to pre-publish stable answers (in an agent card) so common questions never round-trip.
-3. **Question vocabulary.** A small core registry of well-known ids (`purpose`, `retention`, `human_in_loop`) so servers don't each invent their own, without a committee gating anything.
-4. **Negotiation.** A client that declines should be able to counter-offer: "not that, but I'll accept this narrower scope."
+2. **Standing answers.** Pre-publishing stable answers in an agent card so common requirements never round-trip.
+3. **Requirement vocabulary.** A small registry of well-known ids (`purpose`, `retention`, `human_in_loop`) so servers don't each invent their own, without a committee gating anything.
+4. **Counter-offers.** A declining client should be able to propose a narrower scope instead of just failing.
 5. **Receipts.** Should the client get a signed record of what it was asked and what it answered? Symmetry matters if this becomes common.
-6. **Compute-bearing answers.** If a question's answer requires real work by the agent, the server has effectively priced access in the client's compute. Where's the line between a fair question and a work requirement?
+6. **Task economics.** `limits` makes cost visible, but not fair. Who decides that five seconds of inference is a reasonable price for a document, and what stops a server from asking a thousand agents the same question and calling the consensus a dataset?

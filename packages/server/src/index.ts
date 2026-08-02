@@ -1,5 +1,6 @@
 /**
- * @thomasdavis/crap-server — issue challenges, validate answers, mint scoped proofs.
+ * @thomasdavis/crap-server — issue challenges, validate answers, mint scoped
+ * continuation proofs.
  *
  * Transport-neutral core plus a thin Node `http` adapter. The core knows
  * nothing about frameworks: you hand it a description of the request and it
@@ -8,8 +9,8 @@
 
 import { createHmac, randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import {
-  ASSURANCE_ORDER,
   CRAP_VERSION,
+  EVIDENCE_CLASSES,
   HEADER_ACCEPT,
   HEADER_CHALLENGE_ID,
   HEADER_INPUT_PROOF,
@@ -18,12 +19,15 @@ import {
   RESPONSE_MEDIA_TYPE,
   STATUS_COMPAT,
   STATUS_INPUT_REQUIRED,
-  assuranceAtLeast,
+  SUBMISSION_PATH_PREFIX,
+  clientSupportsVersion,
   isExpired,
+  submissionPath,
   validateValue,
-  type Assurance,
   type Challenge,
   type ChallengeResponse,
+  type EvidenceClass,
+  type EvidenceDescriptor,
   type InputRequest,
   type ProblemDocument,
   type ValidationError,
@@ -34,12 +38,12 @@ export * from '@thomasdavis/crap-schema';
 /** The request, reduced to what a policy decision actually needs. */
 export interface RequestContext {
   method: string;
-  /** Absolute URI of the target resource. */
+  /** Absolute effective request URI. */
   target: string;
   headers: Record<string, string | string[] | undefined>;
   /** Authenticated principal, if your auth layer resolved one. */
   principal?: string;
-  /** Raw body, when there is one — used for request binding. */
+  /** Raw body. Absence and emptiness are distinguished — see hasContent(). */
   body?: Buffer | string;
 }
 
@@ -55,10 +59,10 @@ export const inputRequired = (
   opts: { detail?: string; ttlSeconds?: number } = {},
 ): Decision => ({ kind: 'input_required', requests, ...opts });
 
-/** An answer that survived validation, with how much it is worth. */
+/** An accepted answer, with a structured account of how it was established. */
 export interface GradedAnswer {
   value: unknown;
-  assurance: Assurance;
+  evidence: EvidenceDescriptor;
 }
 
 export interface SatisfiedInput {
@@ -69,28 +73,44 @@ export interface SatisfiedInput {
   round: number;
 }
 
-export interface ProofVerifier {
+export interface EvidenceVerifier {
   /**
-   * Verify one `proof` mode answer. Return the assurance it earns, or null to
-   * reject. Default policy: reject everything, because an unverified proof is
-   * just a string that says "proof".
+   * Verify one `evidence` answer. Return a descriptor, a bare class, or null
+   * to reject. Default policy: reject everything, because an unverified proof
+   * is just a string that says "proof".
    */
   (input: {
     request: InputRequest;
     answer: unknown;
     context: RequestContext;
     challenge: Challenge;
-  }): Promise<Assurance | null> | Assurance | null;
+  }): Promise<EvidenceDescriptor | EvidenceClass | null> | EvidenceDescriptor | EvidenceClass | null;
 }
 
 export interface ChallengeStore {
   put(challenge: Challenge): Promise<void>;
   get(id: string): Promise<Challenge | undefined>;
-  /** Mark consumed. Must return false if it was already consumed (replay). */
+  /** Mark consumed. Must return false if already consumed (replay). */
   consume(id: string): Promise<boolean>;
 }
 
-/** Default in-process store. Fine for one node; swap for Redis in a fleet. */
+/** A minted decision, referenced by an opaque handle. */
+export interface DecisionRecord {
+  id: string;
+  challengeId: string;
+  scopeHash: string;
+  principal: string | null;
+  round: number;
+  answers: Record<string, GradedAnswer>;
+  declined: string[];
+  expiresAt: number;
+}
+
+export interface DecisionStore {
+  put(record: DecisionRecord): Promise<void>;
+  get(id: string): Promise<DecisionRecord | undefined>;
+}
+
 export class MemoryChallengeStore implements ChallengeStore {
   private live = new Map<string, { challenge: Challenge; consumed: boolean }>();
 
@@ -118,18 +138,44 @@ export class MemoryChallengeStore implements ChallengeStore {
   }
 }
 
+export class MemoryDecisionStore implements DecisionStore {
+  private live = new Map<string, DecisionRecord>();
+
+  async put(record: DecisionRecord): Promise<void> {
+    this.live.set(record.id, record);
+    const now = Date.now();
+    for (const [id, r] of this.live) if (r.expiresAt <= now) this.live.delete(id);
+  }
+
+  async get(id: string): Promise<DecisionRecord | undefined> {
+    const record = this.live.get(id);
+    if (record && record.expiresAt <= Date.now()) {
+      this.live.delete(id);
+      return undefined;
+    }
+    return record;
+  }
+}
+
 export interface CrapServerOptions {
   /** Absolute origin of this server, e.g. `https://data.example`. */
   issuer: string;
-  /** Secret used to mint continuation proofs. Rotate it like any other key. */
+  /** Secret used to authenticate proof handles. Rotate like any other key. */
   secret: string | Buffer;
   /** Your policy. Return allow / deny / input_required. */
   evaluate(ctx: RequestContext, satisfied?: SatisfiedInput): Promise<Decision> | Decision;
   store?: ChallengeStore;
-  verifyProof?: ProofVerifier;
+  decisions?: DecisionStore;
+  verifyEvidence?: EvidenceVerifier;
+  /**
+   * `opaque` (default): the proof is a random handle; answers stay server-side.
+   * `stateless`: the proof carries a digest of the answers, not the answers.
+   * Neither puts answer values in a header.
+   */
+  proofMode?: 'opaque' | 'stateless';
   /** Seconds a challenge stays answerable. Default 900. */
   ttlSeconds?: number;
-  /** Consecutive challenges allowed for one operation before a hard 403. Default 3. */
+  /** Consecutive challenges for one operation before a hard 403. Default 3. */
   maxRounds?: number;
   /** Seconds an issued Input-Proof is good for. Default 300. */
   proofTtlSeconds?: number;
@@ -142,7 +188,6 @@ export interface CrapResponse {
   body: string;
 }
 
-/** What `handle()` tells the caller to do next. */
 export type HandleResult =
   | { kind: 'allow'; satisfied?: SatisfiedInput }
   | { kind: 'respond'; response: CrapResponse };
@@ -153,7 +198,9 @@ export class CrapServer {
   constructor(options: CrapServerOptions) {
     this.opts = {
       store: new MemoryChallengeStore(),
-      verifyProof: () => null,
+      decisions: new MemoryDecisionStore(),
+      verifyEvidence: () => null,
+      proofMode: 'opaque',
       ttlSeconds: 900,
       maxRounds: 3,
       proofTtlSeconds: 300,
@@ -163,20 +210,19 @@ export class CrapServer {
 
   /**
    * The whole protocol, one call. Feed it every request to a protected
-   * resource; it returns either "allow, carry on" or a response to send.
+   * resource; it returns "allow, carry on" or a response to send.
    */
   async handle(ctx: RequestContext): Promise<HandleResult> {
-    const contentType = header(ctx.headers, 'content-type') ?? '';
-    if (contentType.startsWith(RESPONSE_MEDIA_TYPE)) {
+    if (this.isSubmission(ctx)) {
       return { kind: 'respond', response: await this.submit(ctx) };
     }
 
     const proof = header(ctx.headers, HEADER_INPUT_PROOF);
     let satisfied: SatisfiedInput | undefined;
     if (proof) {
-      const verified = this.verifyInputProof(proof, ctx);
+      const verified = await this.verifyInputProof(proof, ctx);
       if (!verified.ok) {
-        return { kind: 'respond', response: problemResponse(STATUS_COMPAT, 'Invalid Input Proof', verified.reason) };
+        return { kind: 'respond', response: this.problem(ctx, STATUS_COMPAT, 'Invalid Input Proof', verified.reason) };
       }
       satisfied = verified.satisfied;
     }
@@ -184,19 +230,14 @@ export class CrapServer {
     const decision = await this.opts.evaluate(ctx, satisfied);
     if (decision.kind === 'allow') return { kind: 'allow', satisfied };
     if (decision.kind === 'deny') {
-      return { kind: 'respond', response: problemResponse(STATUS_COMPAT, 'Forbidden', decision.reason) };
+      return { kind: 'respond', response: this.problem(ctx, STATUS_COMPAT, 'Forbidden', decision.reason) };
     }
 
     const round = (satisfied?.round ?? 0) + 1;
-    const maxRounds = this.opts.maxRounds;
-    if (round > maxRounds) {
+    if (round > this.opts.maxRounds) {
       return {
         kind: 'respond',
-        response: problemResponse(
-          STATUS_COMPAT,
-          'Forbidden',
-          `challenge limit reached after ${maxRounds} rounds`,
-        ),
+        response: this.problem(ctx, STATUS_COMPAT, 'Forbidden', `challenge limit reached after ${this.opts.maxRounds} rounds`),
       };
     }
 
@@ -204,12 +245,41 @@ export class CrapServer {
     return { kind: 'respond', response: this.challengeResponse(ctx, challenge, decision.detail) };
   }
 
+  /** Is this a POST to a challenge transaction resource? */
+  private isSubmission(ctx: RequestContext): boolean {
+    if (ctx.method.toUpperCase() !== 'POST') return false;
+    try {
+      return new URL(ctx.target).pathname.startsWith(`${SUBMISSION_PATH_PREFIX}/`);
+    } catch {
+      return false;
+    }
+  }
+
+  private challengeIdFromTarget(target: string): string | undefined {
+    try {
+      const { pathname } = new URL(target);
+      const match = pathname.match(
+        new RegExp(`^${SUBMISSION_PATH_PREFIX}/([^/]+)/responses/?$`),
+      );
+      return match ? decodeURIComponent(match[1]) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Build and persist a challenge bound to this exact request. */
-  async issue(ctx: RequestContext, decision: Extract<Decision, { kind: 'input_required' }>, round = 1): Promise<Challenge> {
+  async issue(
+    ctx: RequestContext,
+    decision: Extract<Decision, { kind: 'input_required' }>,
+    round = 1,
+  ): Promise<Challenge> {
     const ttl = decision.ttlSeconds ?? this.opts.ttlSeconds;
     const now = new Date();
+    const id = `ch_${randomBytes(12).toString('base64url')}`;
+    const withContent = hasContent(ctx);
+
     const challenge: Challenge = {
-      id: `ch_${randomBytes(12).toString('base64url')}`,
+      id,
       version: CRAP_VERSION,
       issuer: this.opts.issuer,
       issued_at: now.toISOString(),
@@ -218,15 +288,14 @@ export class CrapServer {
       scope: {
         method: ctx.method.toUpperCase(),
         target: ctx.target,
-        principal: ctx.principal,
-        ...(ctx.body !== undefined && ctx.body !== null && ctx.body.length
-          ? { request_digest: digest(ctx.body) }
-          : {}),
+        has_content: withContent,
+        ...(withContent ? { content_digest: contentDigest(ctx.body!) } : {}),
+        ...(ctx.principal ? { principal: ctx.principal } : {}),
       },
       input_requests: decision.requests,
       submission: {
         method: 'POST',
-        target: ctx.target,
+        target: new URL(submissionPath(id), this.opts.issuer).toString(),
         content_type: RESPONSE_MEDIA_TYPE,
       },
       continuation: { mode: 'retry-original-request' },
@@ -239,17 +308,19 @@ export class CrapServer {
   }
 
   /**
-   * Render a challenge, honouring capability negotiation: native 430 only for
-   * clients that said they understand it, 403 + problem+json for everyone else.
+   * Render a challenge. The compatibility profile (`403`) is the baseline;
+   * native `430` only for clients that advertised the exact version.
    */
   challengeResponse(ctx: RequestContext, challenge: Challenge, detail?: string): CrapResponse {
-    const accepts = (header(ctx.headers, HEADER_ACCEPT) ?? '').includes(`v=${CRAP_VERSION}`);
-    const status = accepts ? STATUS_INPUT_REQUIRED : STATUS_COMPAT;
+    const native = clientSupportsVersion(header(ctx.headers, HEADER_ACCEPT));
+    const status = native ? STATUS_INPUT_REQUIRED : STATUS_COMPAT;
     const problem: ProblemDocument = {
       type: PROBLEM_TYPE,
       title: 'Input Required',
+      // RFC 9457 §3.1: this MUST match the response status, so the two
+      // profiles are semantically identical but not byte-identical.
       status,
-      detail: detail ?? 'This resource has questions that must be answered before it can be served.',
+      detail: detail ?? 'This resource requires additional input before it can be served.',
       instance: ctx.target,
       challenge,
     };
@@ -258,6 +329,7 @@ export class CrapServer {
       headers: {
         'content-type': PROBLEM_MEDIA_TYPE,
         'cache-control': 'no-store',
+        vary: HEADER_ACCEPT,
         [HEADER_CHALLENGE_ID]: challenge.id,
         link: `<${challenge.submission.target}>; rel="https://crap.donto.org/rels/submit-input"`,
       },
@@ -265,29 +337,30 @@ export class CrapServer {
     };
   }
 
-  /** Handle a POST of `application/crap-response+json`. */
+  /** Handle a POST to a challenge transaction resource. */
   async submit(ctx: RequestContext): Promise<CrapResponse> {
     let parsed: ChallengeResponse;
     try {
       parsed = JSON.parse(typeof ctx.body === 'string' ? ctx.body : (ctx.body ?? Buffer.alloc(0)).toString('utf8'));
     } catch {
-      return problemResponse(400, 'Bad Request', 'submission body is not valid JSON');
+      return this.problem(ctx, 400, 'Bad Request', 'submission body is not valid JSON');
+    }
+
+    const pathId = this.challengeIdFromTarget(ctx.target);
+    if (!pathId) return this.problem(ctx, 404, 'Not Found', 'not a challenge transaction resource');
+    if (pathId !== parsed.challenge_id) {
+      return this.problem(ctx, STATUS_COMPAT, 'Invalid Submission', 'challenge id does not match the transaction resource');
     }
 
     const challenge = await this.opts.store.get(parsed.challenge_id);
-    if (!challenge) return problemResponse(STATUS_COMPAT, 'Unknown Challenge', 'no such challenge');
-    if (isExpired(challenge)) return problemResponse(STATUS_COMPAT, 'Challenge Expired', 'challenge has expired');
+    if (!challenge) return this.problem(ctx, STATUS_COMPAT, 'Unknown Challenge', 'no such challenge');
+    if (isExpired(challenge)) return this.problem(ctx, STATUS_COMPAT, 'Challenge Expired', 'challenge has expired');
 
-    // Binding: the answers must come back for the same request, from the same
-    // principal, with the nonce we handed out.
-    if (!safeEqual(parsed.request_state, challenge.request_state)) {
-      return problemResponse(STATUS_COMPAT, 'Invalid Submission', 'request_state mismatch');
+    if (!safeEqual(parsed.request_state ?? '', challenge.request_state)) {
+      return this.problem(ctx, STATUS_COMPAT, 'Invalid Submission', 'request_state mismatch');
     }
-    if (challenge.scope.principal && challenge.scope.principal !== ctx.principal) {
-      return problemResponse(STATUS_COMPAT, 'Invalid Submission', 'principal mismatch');
-    }
-    if (normaliseTarget(challenge.submission.target) !== normaliseTarget(ctx.target)) {
-      return problemResponse(STATUS_COMPAT, 'Invalid Submission', 'submitted to the wrong target');
+    if ((challenge.scope.principal ?? null) !== (ctx.principal ?? null)) {
+      return this.problem(ctx, STATUS_COMPAT, 'Invalid Submission', 'principal mismatch');
     }
 
     const declined = parsed.declined ?? [];
@@ -296,9 +369,7 @@ export class CrapServer {
 
     for (const request of challenge.input_requests) {
       if (declined.includes(request.id)) {
-        if (request.required) {
-          errors.push({ path: `/${request.id}`, message: 'declined but required' });
-        }
+        if (request.required) errors.push({ path: `/${request.id}`, message: 'declined but required' });
         continue;
       }
       const raw = parsed.input_responses?.[request.id];
@@ -307,36 +378,44 @@ export class CrapServer {
         continue;
       }
 
-      if (request.mode === 'form') {
-        const schemaErrors = validateValue(raw, request.schema ?? {}, `/${request.id}`);
+      if (request.kind === 'declaration' || request.kind === 'task') {
+        const schema = request.kind === 'task' ? request.output_schema : request.schema;
+        const schemaErrors = validateValue(raw, schema ?? {}, `/${request.id}`);
         if (schemaErrors.length) {
           errors.push(...schemaErrors);
           continue;
         }
-        answers[request.id] = { value: raw, assurance: 'A0' };
-      } else {
-        const assurance = await this.opts.verifyProof({ request, answer: raw, context: ctx, challenge });
-        if (!assurance) {
-          errors.push({ path: `/${request.id}`, message: 'evidence rejected' });
-          continue;
-        }
-        answers[request.id] = { value: raw, assurance };
+        answers[request.id] = { value: raw, evidence: { class: 'self_asserted' } };
+        continue;
       }
 
-      const want = request.min_assurance;
-      const got = answers[request.id]?.assurance;
-      if (want && got && !assuranceAtLeast(got, want)) {
+      // evidence / approval both require verification.
+      const verified = await this.opts.verifyEvidence({ request, answer: raw, context: ctx, challenge });
+      if (!verified) {
+        errors.push({ path: `/${request.id}`, message: 'evidence rejected' });
+        continue;
+      }
+      const evidence: EvidenceDescriptor = typeof verified === 'string' ? { class: verified } : verified;
+      if (!EVIDENCE_CLASSES.includes(evidence.class)) {
+        errors.push({ path: `/${request.id}`, message: `unknown evidence class "${evidence.class}"` });
+        continue;
+      }
+      // Set membership, not rank: the issuer said which classes it accepts.
+      const accepted = request.accepted_evidence;
+      if (accepted && !accepted.includes(evidence.class)) {
         errors.push({
           path: `/${request.id}`,
-          message: `assurance ${got} below required ${want}`,
+          message: `evidence class ${evidence.class} is not in accepted_evidence [${accepted.join(', ')}]`,
         });
-        delete answers[request.id];
+        continue;
       }
+      answers[request.id] = { value: raw, evidence };
     }
 
     if (errors.length) {
       return {
-        ...problemResponse(422, 'Unprocessable Content', 'one or more answers were rejected'),
+        status: 422,
+        headers: { 'content-type': PROBLEM_MEDIA_TYPE, 'cache-control': 'no-store' },
         body: JSON.stringify(
           {
             type: `${PROBLEM_TYPE}#rejected`,
@@ -351,99 +430,160 @@ export class CrapServer {
       };
     }
 
-    // One-shot: a challenge cannot be answered twice.
     if (!(await this.opts.store.consume(challenge.id))) {
-      return problemResponse(STATUS_COMPAT, 'Replay', 'challenge already answered');
+      return this.problem(ctx, STATUS_COMPAT, 'Replay', 'challenge already answered');
     }
 
-    const satisfied: SatisfiedInput = {
+    const proof = await this.mintInputProof(challenge, {
       challengeId: challenge.id,
       answers,
       declined,
       principal: ctx.principal,
       round: challenge.round,
-    };
-    const proof = this.mintInputProof(challenge, satisfied);
+    });
 
     return {
       status: 204,
-      headers: {
-        [HEADER_INPUT_PROOF]: proof,
-        'cache-control': 'no-store',
-      },
+      headers: { [HEADER_INPUT_PROOF]: proof, 'cache-control': 'no-store' },
       body: '',
     };
   }
 
   /**
-   * A continuation proof is a signed, scoped, expiring statement that these
-   * answers were accepted for this exact request. It is not a session token
-   * and must not be usable as one.
+   * A continuation proof says "these requirements were satisfied for this
+   * exact request". It is NOT a session token and carries no answer values —
+   * headers end up in logs and intermediary telemetry.
    */
-  mintInputProof(challenge: Challenge, satisfied: SatisfiedInput): string {
-    const payload = {
-      v: CRAP_VERSION,
-      cid: challenge.id,
-      iss: this.opts.issuer,
-      sub: satisfied.principal ?? null,
-      method: challenge.scope.method,
-      target: normaliseTarget(challenge.scope.target),
-      digest: challenge.scope.request_digest ?? null,
-      round: challenge.round,
-      exp: Math.floor(Date.now() / 1000) + this.opts.proofTtlSeconds,
-      ans: Object.fromEntries(
-        Object.entries(satisfied.answers).map(([k, a]) => [k, { v: a.value, a: a.assurance }]),
-      ),
-      dec: satisfied.declined,
-    };
-    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-    return `${body}.${this.sign(body)}`;
+  async mintInputProof(challenge: Challenge, satisfied: SatisfiedInput): Promise<string> {
+    const expiresAt = Date.now() + this.opts.proofTtlSeconds * 1000;
+    const scopeHash = this.scopeHash(challenge.scope);
+    const id = `dec_${randomBytes(18).toString('base64url')}`;
+
+    await this.opts.decisions.put({
+      id,
+      challengeId: challenge.id,
+      scopeHash,
+      principal: satisfied.principal ?? null,
+      round: satisfied.round,
+      answers: satisfied.answers,
+      declined: satisfied.declined,
+      expiresAt,
+    });
+
+    if (this.opts.proofMode === 'opaque') {
+      return `ip1.${id}.${this.sign(id)}`;
+    }
+    // Stateless: a decision id plus a digest of the answers. Still no values.
+    const payload = Buffer.from(
+      JSON.stringify({
+        v: CRAP_VERSION,
+        id,
+        cid: challenge.id,
+        scope: scopeHash,
+        sub: satisfied.principal ?? null,
+        round: satisfied.round,
+        adigest: sha256(JSON.stringify(satisfied.answers)),
+        exp: Math.floor(expiresAt / 1000),
+      }),
+    ).toString('base64url');
+    return `ip2.${payload}.${this.sign(payload)}`;
   }
 
-  verifyInputProof(
+  async verifyInputProof(
     token: string,
     ctx: RequestContext,
-  ): { ok: true; satisfied: SatisfiedInput } | { ok: false; reason: string } {
-    const [body, sig] = token.split('.');
-    if (!body || !sig) return { ok: false, reason: 'malformed proof' };
+  ): Promise<{ ok: true; satisfied: SatisfiedInput } | { ok: false; reason: string }> {
+    const [profile, body, sig] = token.split('.');
+    if (!profile || !body || !sig) return { ok: false, reason: 'malformed proof' };
     if (!safeEqual(sig, this.sign(body))) return { ok: false, reason: 'bad signature' };
 
-    let payload: any;
-    try {
-      payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    } catch {
-      return { ok: false, reason: 'unreadable proof' };
+    let decisionId: string;
+    if (profile === 'ip1') {
+      decisionId = body;
+    } else if (profile === 'ip2') {
+      try {
+        const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (payload.v !== CRAP_VERSION) return { ok: false, reason: 'unsupported proof version' };
+        if (typeof payload.exp !== 'number' || payload.exp * 1000 <= Date.now()) {
+          return { ok: false, reason: 'proof expired' };
+        }
+        decisionId = payload.id;
+      } catch {
+        return { ok: false, reason: 'unreadable proof' };
+      }
+    } else {
+      return { ok: false, reason: 'unknown proof profile' };
     }
 
-    if (payload.v !== CRAP_VERSION) return { ok: false, reason: 'unsupported proof version' };
-    if (payload.iss !== this.opts.issuer) return { ok: false, reason: 'proof issued by another origin' };
-    if (typeof payload.exp !== 'number' || payload.exp * 1000 <= Date.now()) {
-      return { ok: false, reason: 'proof expired' };
-    }
-    // The binding that stops a GET proof opening a DELETE.
-    if (payload.method !== ctx.method.toUpperCase()) return { ok: false, reason: 'method mismatch' };
-    if (payload.target !== normaliseTarget(ctx.target)) return { ok: false, reason: 'target mismatch' };
-    if ((payload.sub ?? null) !== (ctx.principal ?? null)) return { ok: false, reason: 'principal mismatch' };
-    if (payload.digest && ctx.body !== undefined && payload.digest !== digest(ctx.body)) {
-      return { ok: false, reason: 'body digest mismatch' };
-    }
+    const record = await this.opts.decisions.get(decisionId);
+    if (!record) return { ok: false, reason: 'unknown or expired proof' };
+    if (record.expiresAt <= Date.now()) return { ok: false, reason: 'proof expired' };
+    if ((record.principal ?? null) !== (ctx.principal ?? null)) return { ok: false, reason: 'principal mismatch' };
 
-    const answers: Record<string, GradedAnswer> = {};
-    for (const [k, a] of Object.entries(payload.ans ?? {})) {
-      const entry = a as { v: unknown; a: Assurance };
-      if (!ASSURANCE_ORDER.includes(entry.a)) return { ok: false, reason: 'unknown assurance level' };
-      answers[k] = { value: entry.v, assurance: entry.a };
+    // Full scope binding: method, exact target, AND content presence/digest.
+    const presented = this.scopeHash({
+      method: ctx.method.toUpperCase(),
+      target: ctx.target,
+      has_content: hasContent(ctx),
+      ...(hasContent(ctx) ? { content_digest: contentDigest(ctx.body!) } : {}),
+      ...(ctx.principal ? { principal: ctx.principal } : {}),
+    });
+    if (presented !== record.scopeHash) {
+      return { ok: false, reason: await this.scopeMismatchReason(record, ctx) };
     }
 
     return {
       ok: true,
       satisfied: {
-        challengeId: payload.cid,
-        answers,
-        declined: payload.dec ?? [],
+        challengeId: record.challengeId,
+        answers: record.answers,
+        declined: record.declined,
         principal: ctx.principal,
-        round: payload.round ?? 1,
+        round: record.round,
       },
+    };
+  }
+
+  /**
+   * Which component differed. Recomputed against the stored challenge so the
+   * error is useful; the check itself is the single hash comparison above.
+   */
+  private async scopeMismatchReason(record: DecisionRecord, ctx: RequestContext): Promise<string> {
+    const challenge = await this.opts.store.get(record.challengeId);
+    if (!challenge) return 'scope mismatch';
+    const scope = challenge.scope;
+    if (scope.method.toUpperCase() !== ctx.method.toUpperCase()) return 'method mismatch';
+    if (scope.target !== ctx.target) return 'target mismatch';
+    if (scope.has_content !== hasContent(ctx)) return 'request content presence mismatch';
+    if (scope.content_digest && hasContent(ctx) && scope.content_digest !== contentDigest(ctx.body!)) {
+      return 'content digest mismatch';
+    }
+    return 'scope mismatch';
+  }
+
+  private scopeHash(scope: Challenge['scope']): string {
+    return sha256(
+      JSON.stringify([
+        this.opts.issuer,
+        scope.method.toUpperCase(),
+        scope.target,
+        scope.has_content,
+        scope.content_digest ?? null,
+        scope.principal ?? null,
+      ]),
+    );
+  }
+
+  private problem(ctx: RequestContext, status: number, title: string, detail?: string): CrapResponse {
+    void ctx;
+    return {
+      status,
+      headers: {
+        'content-type': PROBLEM_MEDIA_TYPE,
+        'cache-control': 'no-store',
+        vary: HEADER_ACCEPT,
+      },
+      body: JSON.stringify({ type: `${PROBLEM_TYPE}#error`, title, status, detail }, null, 2),
     };
   }
 
@@ -459,21 +599,22 @@ export function header(headers: RequestContext['headers'], name: string): string
   return Array.isArray(value) ? value[0] : value;
 }
 
-function digest(body: Buffer | string): string {
-  const hash = createHash('sha256').update(body).digest('base64');
-  return `sha-256=:${hash}:`;
+/**
+ * Content presence, distinguished from absence. A proof minted for a request
+ * with content must not be presentable on one without it, and vice versa.
+ */
+export function hasContent(ctx: Pick<RequestContext, 'body'>): boolean {
+  if (ctx.body === undefined || ctx.body === null) return false;
+  return ctx.body.length > 0;
 }
 
-/** Compare origin + path, ignoring query order and default ports. */
-function normaliseTarget(target: string): string {
-  try {
-    const url = new URL(target);
-    url.searchParams.sort();
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return target;
-  }
+/** RFC 9530 Content-Digest, sha-256. */
+export function contentDigest(body: Buffer | string): string {
+  return `sha-256=:${createHash('sha256').update(body).digest('base64')}:`;
+}
+
+function sha256(input: string): string {
+  return createHash('sha256').update(input).digest('base64url');
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -486,19 +627,12 @@ function safeEqual(a: string, b: string): boolean {
 export function problemResponse(status: number, title: string, detail?: string): CrapResponse {
   return {
     status,
-    headers: { 'content-type': PROBLEM_MEDIA_TYPE, 'cache-control': 'no-store' },
+    headers: { 'content-type': PROBLEM_MEDIA_TYPE, 'cache-control': 'no-store', vary: HEADER_ACCEPT },
     body: JSON.stringify({ type: `${PROBLEM_TYPE}#error`, title, status, detail }, null, 2),
   };
 }
 
 /* ------------------------- node http adapter ------------------------- */
-
-export interface NodeLikeRequest {
-  method?: string;
-  url?: string;
-  headers: Record<string, string | string[] | undefined>;
-  on(event: string, cb: (...args: any[]) => void): unknown;
-}
 
 export interface NodeLikeResponse {
   writeHead(status: number, headers: Record<string, string>): unknown;
@@ -509,7 +643,10 @@ export interface NodeLikeResponse {
  * Express/Node middleware. On allow it sets `req.crap` to the graded answers
  * and calls next(); otherwise it writes the protocol response itself.
  */
-export function crapMiddleware(server: CrapServer, opts: { origin: string; principal?: (req: any) => string | undefined } = { origin: '' }) {
+export function crapMiddleware(
+  server: CrapServer,
+  opts: { origin: string; principal?: (req: any) => string | undefined },
+) {
   return async (req: any, res: NodeLikeResponse, next: () => void) => {
     const body = await readBody(req);
     const ctx: RequestContext = {
@@ -530,8 +667,8 @@ export function crapMiddleware(server: CrapServer, opts: { origin: string; princ
   };
 }
 
-async function readBody(req: NodeLikeRequest): Promise<Buffer> {
-  if ((req as any).rawBody) return (req as any).rawBody;
+async function readBody(req: any): Promise<Buffer> {
+  if (req.rawBody) return req.rawBody;
   const chunks: Buffer[] = [];
   await new Promise<void>((resolve, reject) => {
     req.on('data', (c: Buffer) => chunks.push(Buffer.from(c)));

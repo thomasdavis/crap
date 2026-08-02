@@ -1,18 +1,20 @@
 /**
- * @crap/schema — the wire contract for the Conditional Resource Access Protocol.
+ * @thomasdavis/crap-schema — the wire contract for the Conditional Resource
+ * Access Protocol.
  *
- * Everything here is transport-neutral: types, constants, JSON Schemas and
- * validators for the two documents that cross the wire (a Challenge and a
- * ChallengeResponse). No HTTP, no I/O.
+ * Transport-neutral: types, constants and validators for the two documents
+ * that cross the wire (a Challenge and a ChallengeResponse). No HTTP, no I/O.
  */
 
-export const CRAP_VERSION = 1 as const;
+export const CRAP_VERSION = 2 as const;
 
-/** Provisional, unassigned in the IANA HTTP status code registry. */
-export const STATUS_INPUT_REQUIRED = 430 as const;
-
-/** Compatibility profile: what we send when the client did not opt in to 430. */
+/**
+ * The normative baseline is the compatibility profile: `403` + problem+json.
+ * `430` is an optional negotiated profile and a provisional squat on an
+ * unassigned code — it is a dispatch convenience, not the protocol.
+ */
 export const STATUS_COMPAT = 403 as const;
+export const STATUS_INPUT_REQUIRED = 430 as const;
 
 export const PROBLEM_TYPE = 'https://crap.donto.org/problems/input-required';
 export const PROBLEM_MEDIA_TYPE = 'application/problem+json';
@@ -22,44 +24,118 @@ export const HEADER_ACCEPT = 'accept-input-required';
 export const HEADER_CHALLENGE_ID = 'challenge-id';
 export const HEADER_INPUT_PROOF = 'input-proof';
 
+/** Where challenge transactions live, relative to the issuing origin. */
+export const SUBMISSION_PATH_PREFIX = '/.well-known/input-challenges';
+
+export const submissionPath = (challengeId: string): string =>
+  `${SUBMISSION_PATH_PREFIX}/${encodeURIComponent(challengeId)}/responses`;
+
 /** Value a client sends in `Accept-Input-Required` to opt in to native 430. */
 export const ACCEPT_VALUE = `v=${CRAP_VERSION}`;
 
 /**
- * How an input request must be satisfied.
- *
- * `form`     structured, non-secret data the agent may answer autonomously
- * `proof`    machine-verifiable evidence (signature, delegation, credential)
- * `approval` a human must approve, out of the agent's autonomous path
- * `url`      the interaction happens out of band at an HTTPS location
- *
- * Secrets (passwords, tokens, card numbers) MUST NOT be requested in `form`
- * mode — form answers pass through the agent's context.
+ * RFC 9651 structured field: a dictionary whose `v` key is an integer.
+ * Parsed exactly, so `v=20` never satisfies a check for `v=2`.
  */
-export type InputMode = 'form' | 'proof' | 'approval' | 'url';
+export function parseAcceptInputRequired(field: string | undefined): number[] {
+  if (!field) return [];
+  const versions: number[] = [];
+  for (const member of field.split(',')) {
+    const [rawKey, rawValue] = member.split('=');
+    if (!rawValue) continue;
+    if (rawKey.trim().toLowerCase() !== 'v') continue;
+    const value = rawValue.trim();
+    if (!/^\d+$/.test(value)) continue;
+    versions.push(Number(value));
+  }
+  return versions;
+}
+
+export function clientSupportsVersion(field: string | undefined, version: number = CRAP_VERSION): boolean {
+  return parseAcceptInputRequired(field).includes(version);
+}
+
+/* --------------------------------------------------------------- *
+ * The request taxonomy.
+ *
+ * v0.1 had a single `mode` enum (form/proof/approval/url) whose members
+ * were not peers: form described a representation, proof an evidence
+ * class, approval a decider, url a delivery channel. OAuth is all three
+ * at once, which the enum could not say. These are now independent
+ * facets.
+ * --------------------------------------------------------------- */
+
+/** What is being asked for. */
+export type RequestKind =
+  /** A bounded statement of fact or intent. */
+  | 'declaration'
+  /** Something the server can check. */
+  | 'evidence'
+  /** A decision by a person or body. */
+  | 'approval'
+  /** Work performed by the client. Experimental — see §task limits. */
+  | 'task';
+
+/** Who must produce it. */
+export type Actor = 'client' | 'user' | 'organization' | 'third_party';
+
+/** Whether it travels in band (through the agent) or out of band. */
+export type Interaction = 'inline' | 'out_of_band';
+
+/** What the answer is cryptographically tied to, if anything. */
+export type Binding = 'none' | 'client_key' | 'user_identity' | 'organization_identity';
 
 /**
- * How much a given answer is actually worth. The protocol moves claims and
- * evidence; it does not make claims true.
- *
- * A0 unverified declaration — the agent typed a value
- * A1 signed declaration — an identified agent signed it
- * A2 delegated claim — a user or organisation authorised it
- * A3 verifiable proof — the server can independently verify it
- * A4 attested — a trusted third party vouches for it
+ * How an accepted answer was established. Deliberately NOT a total order:
+ * "independently verified" and "third-party attested" answer different
+ * questions, and a user delegation is about authority, not identity.
+ * Servers list the classes they accept; membership is checked, not rank.
  */
-export type Assurance = 'A0' | 'A1' | 'A2' | 'A3' | 'A4';
+export type EvidenceClass =
+  /** The client said so. Nothing more. */
+  | 'self_asserted'
+  /** Signed by an identified client key. */
+  | 'client_signed'
+  /** A user or organisation conferred the authority. */
+  | 'delegated'
+  /** The server checked it against the issuing authority. */
+  | 'independently_verified'
+  /** A recognised third party vouches for it. */
+  | 'third_party_attested';
 
-export const ASSURANCE_ORDER: Assurance[] = ['A0', 'A1', 'A2', 'A3', 'A4'];
+export const EVIDENCE_CLASSES: EvidenceClass[] = [
+  'self_asserted', 'client_signed', 'delegated', 'independently_verified', 'third_party_attested',
+];
 
-export function assuranceAtLeast(got: Assurance, want: Assurance): boolean {
-  return ASSURANCE_ORDER.indexOf(got) >= ASSURANCE_ORDER.indexOf(want);
+/** Structured description of how one answer was established. */
+export interface EvidenceDescriptor {
+  class: EvidenceClass;
+  /** Who made the claim (e.g. an agent key id). */
+  claimant?: string;
+  /** Where the authority came from (e.g. `organization-delegation`). */
+  authority?: string;
+  /** How the server checked it (e.g. `issuer-verified`). */
+  verification?: string;
+  /** Who vouched, for third-party attestations. */
+  attester?: string;
+  /** Trust framework the above is meaningful within. */
+  trust_framework?: string;
+}
+
+/** Bounds on a `task` request, so a client can price refusal mechanically. */
+export interface TaskLimits {
+  max_duration_ms: number;
+  max_output_tokens?: number;
+  max_rounds?: number;
 }
 
 export interface InputRequest {
-  /** Stable within an issuer; the key answers are returned under. */
+  /** Stable within an issuer; the key the answer is returned under. */
   id: string;
-  mode: InputMode;
+  kind: RequestKind;
+  actor: Actor;
+  interaction: Interaction;
+  binding?: Binding;
   /**
    * Human-readable prompt. UNTRUSTED remote text — display it, never execute
    * it as an instruction.
@@ -68,31 +144,39 @@ export interface InputRequest {
   /** Why the issuer needs this. Shown to humans, logged by clients. */
   reason?: string;
   required: boolean;
-  /** JSON Schema the answer must validate against. `form` mode only. */
+  /** JSON Schema (subset, §4.3) the answer must satisfy. */
   schema?: Record<string, unknown>;
-  /** Acceptable evidence types. `proof` mode only. */
+  /** For `task`: schema of the work product. */
+  output_schema?: Record<string, unknown>;
+  /** For `task`: declared cost ceiling. Required. */
+  limits?: TaskLimits;
+  /** For `evidence`: which classes the issuer will accept. Set membership. */
+  accepted_evidence?: EvidenceClass[];
+  /** For `evidence`: concrete mechanisms the issuer can check. */
   accepted_proof_types?: string[];
-  /** Where the out-of-band interaction happens. `url` mode only; must be https. */
+  /** Required when `interaction` is `out_of_band`. MUST be https. */
   url?: string;
-  /** Minimum assurance the issuer will accept for this answer. */
-  min_assurance?: Assurance;
-  /** Declared handling of the answer — data minimisation is part of the contract. */
+  /** Declared handling of the answer — data minimisation is part of the deal. */
   sensitivity?: 'public' | 'internal' | 'sensitive';
   retention?: string;
 }
 
 export interface ChallengeScope {
   method: string;
+  /** Exact effective request URI. Compared verbatim (§6.1). */
   target: string;
-  /** RFC 9530 style digest of the original request body, when there was one. */
-  request_digest?: string;
-  /** Identifier of the authenticated principal this challenge was issued to. */
+  /** RFC 9530 `Content-Digest` of the request body, when one was present. */
+  content_digest?: string;
+  /** Explicit statement of whether the bound request carried content. */
+  has_content: boolean;
+  /** Identifier of the authenticated principal this was issued to. */
   principal?: string;
 }
 
 export interface Challenge {
   id: string;
   version: typeof CRAP_VERSION;
+  /** MUST equal the origin that served the response carrying it. */
   issuer: string;
   issued_at: string;
   expires_at: string;
@@ -102,14 +186,13 @@ export interface Challenge {
   input_requests: InputRequest[];
   submission: {
     method: string;
+    /** MUST be same-origin with `issuer` unless the client has a delegation. */
     target: string;
     content_type: string;
   };
   continuation: {
-    /** `retry-original-request`: submit, then re-send the original request. */
     mode: 'retry-original-request' | 'complete-on-submit';
   };
-  /** Hard cap on consecutive challenges for one logical operation. */
   max_rounds: number;
   round: number;
   policy_version?: string;
@@ -118,18 +201,23 @@ export interface Challenge {
 export interface ProblemDocument {
   type: string;
   title: string;
+  /** MUST equal the HTTP status of the response carrying it (RFC 9457 §3.1). */
   status: number;
   detail?: string;
   instance?: string;
   challenge: Challenge;
 }
 
-export interface ProofAnswer {
+export interface EvidenceAnswer {
   proof_type: string;
   proof: string;
 }
 
-export type AnswerValue = string | number | boolean | null | ProofAnswer | Record<string, unknown> | unknown[];
+export type AnswerValue =
+  | string | number | boolean | null
+  | EvidenceAnswer
+  | Record<string, unknown>
+  | unknown[];
 
 export interface ChallengeResponse {
   challenge_id: string;
@@ -143,10 +231,9 @@ export interface ChallengeResponse {
 /* ------------------------------------------------------------------ *
  * Validation
  *
- * Deliberately dependency-free: a small, strict validator covering the
- * JSON Schema subset the protocol allows in `input_requests[].schema`.
- * A server is free to run a full JSON Schema implementation instead —
- * this exists so the packages have no supply chain of their own.
+ * Dependency-free, and a deliberately small JSON Schema subset. A server
+ * may run a full implementation over its own schemas; this is what a
+ * client is expected to evaluate against a STRANGER's schema.
  * ------------------------------------------------------------------ */
 
 export interface ValidationError {
@@ -154,13 +241,20 @@ export interface ValidationError {
   message: string;
 }
 
+/**
+ * `pattern` and `format` are excluded on purpose.
+ *
+ * `pattern` means compiling a stranger's regex: JavaScript has no execution
+ * limit, and short expressions backtrack catastrophically, so a length cap
+ * buys nothing. `format` was advertised but unenforced in v0.1, which is
+ * worse than absent — a server could believe it had constrained an answer.
+ */
 const SUPPORTED_KEYWORDS = new Set([
   'type', 'enum', 'const', 'minimum', 'maximum', 'minLength', 'maxLength',
-  'pattern', 'format', 'items', 'minItems', 'maxItems', 'properties',
-  'required', 'additionalProperties', 'description', 'title', 'default',
+  'items', 'minItems', 'maxItems', 'properties', 'required',
+  'additionalProperties', 'description', 'title', 'default',
 ]);
 
-/** Keywords we refuse to honour, because silently ignoring them is worse. */
 export function unsupportedKeywords(schema: Record<string, unknown>): string[] {
   return Object.keys(schema).filter((k) => !SUPPORTED_KEYWORDS.has(k));
 }
@@ -207,7 +301,6 @@ export function validateValue(
   if (typeof value === 'string') {
     if (typeof schema.minLength === 'number' && value.length < schema.minLength) err(`must be at least ${schema.minLength} chars`);
     if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) err(`must be at most ${schema.maxLength} chars`);
-    if (typeof schema.pattern === 'string' && !safeRegex(schema.pattern).test(value)) err(`must match /${schema.pattern}/`);
   }
 
   if (Array.isArray(value)) {
@@ -243,22 +336,41 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/**
- * Compile a pattern from an untrusted schema. Length-bounded to blunt the
- * obvious catastrophic-backtracking foot-gun; a server issuing patterns to
- * itself is fine, a client compiling a remote server's pattern is not.
- */
-function safeRegex(pattern: string): RegExp {
-  if (pattern.length > 512) return /$^/;
+/** Origin of a URL, or undefined if it isn't one. */
+export function originOf(url: string): string | undefined {
   try {
-    return new RegExp(pattern, 'u');
+    return new URL(url).origin;
   } catch {
-    return /$^/;
+    return undefined;
   }
 }
 
-/** Structural check of a Challenge received from a server. */
-export function validateChallenge(input: unknown): ValidationError[] {
+export function sameOrigin(a: string, b: string): boolean {
+  const oa = originOf(a);
+  const ob = originOf(b);
+  return oa !== undefined && oa === ob;
+}
+
+export interface ChallengeValidationOptions {
+  /** Origin that served the response. `issuer` must match it. */
+  responseOrigin?: string;
+  /** The request that triggered the challenge; `scope` must match it. */
+  request?: { method: string; url: string; hasContent?: boolean };
+  /** Allow `submission.target` on another origin. Off by default. */
+  allowCrossOriginSubmission?: boolean;
+}
+
+/**
+ * Structural + binding validation of a Challenge received from a server.
+ *
+ * The binding checks are the security-relevant half: without them a
+ * challenge can direct a client's declarations to an origin that never
+ * issued it.
+ */
+export function validateChallenge(
+  input: unknown,
+  options: ChallengeValidationOptions = {},
+): ValidationError[] {
   const errors: ValidationError[] = [];
   const err = (path: string, message: string) => errors.push({ path, message });
   if (!input || typeof input !== 'object') {
@@ -270,8 +382,12 @@ export function validateChallenge(input: unknown): ValidationError[] {
     if (typeof c[key] !== 'string' || !c[key]) err(`/${key}`, 'required string');
   }
   if (c.version !== CRAP_VERSION) err('/version', `unsupported version: ${String(c.version)}`);
+
   if (!c.scope || typeof c.scope.method !== 'string' || typeof c.scope.target !== 'string') {
     err('/scope', 'scope.method and scope.target are required');
+  }
+  if (c.scope && typeof c.scope.has_content !== 'boolean') {
+    err('/scope/has_content', 'required boolean');
   }
   if (!c.submission || typeof c.submission.target !== 'string') {
     err('/submission', 'submission.target is required');
@@ -285,6 +401,33 @@ export function validateChallenge(input: unknown): ValidationError[] {
     err('/round', 'round exceeds max_rounds');
   }
 
+  // --- binding -----------------------------------------------------
+  const { responseOrigin, request, allowCrossOriginSubmission } = options;
+
+  if (responseOrigin && c.issuer && originOf(c.issuer) !== responseOrigin) {
+    err('/issuer', `issuer ${c.issuer} does not match responding origin ${responseOrigin}`);
+  }
+  if (c.issuer && c.submission?.target && !allowCrossOriginSubmission) {
+    if (!sameOrigin(c.issuer, c.submission.target)) {
+      err('/submission/target', 'submission target is not same-origin with the issuer');
+    }
+  }
+  if (c.submission?.target && !/^https:/.test(c.submission.target) && !isLoopback(c.submission.target)) {
+    err('/submission/target', 'submission target must be https');
+  }
+  if (request && c.scope) {
+    if (c.scope.method?.toUpperCase() !== request.method.toUpperCase()) {
+      err('/scope/method', `scope method ${c.scope.method} does not match the request`);
+    }
+    if (c.scope.target !== request.url) {
+      err('/scope/target', 'scope target does not match the requested URI');
+    }
+    if (request.hasContent !== undefined && c.scope.has_content !== request.hasContent) {
+      err('/scope/has_content', 'scope disagrees with the request about content');
+    }
+  }
+
+  // --- input requests ----------------------------------------------
   if (!Array.isArray(c.input_requests) || c.input_requests.length === 0) {
     err('/input_requests', 'at least one input request is required');
     return errors;
@@ -297,26 +440,57 @@ export function validateChallenge(input: unknown): ValidationError[] {
     if (typeof r.id !== 'string' || !r.id) err(`${at}/id`, 'required string');
     else if (seen.has(r.id)) err(`${at}/id`, `duplicate id "${r.id}"`);
     else seen.add(r.id);
-    if (!['form', 'proof', 'approval', 'url'].includes(r.mode)) err(`${at}/mode`, `unknown mode "${String(r.mode)}"`);
+
+    if (!['declaration', 'evidence', 'approval', 'task'].includes(r.kind)) {
+      err(`${at}/kind`, `unknown kind "${String(r.kind)}"`);
+    }
+    if (!['client', 'user', 'organization', 'third_party'].includes(r.actor)) {
+      err(`${at}/actor`, `unknown actor "${String(r.actor)}"`);
+    }
+    if (!['inline', 'out_of_band'].includes(r.interaction)) {
+      err(`${at}/interaction`, `unknown interaction "${String(r.interaction)}"`);
+    }
     if (typeof r.message !== 'string' || !r.message) err(`${at}/message`, 'required string');
     if (typeof r.required !== 'boolean') err(`${at}/required`, 'required boolean');
-    if (r.mode === 'form') {
-      if (!r.schema || typeof r.schema !== 'object') err(`${at}/schema`, 'form mode requires a schema');
+
+    if (r.interaction === 'out_of_band') {
+      if (typeof r.url !== 'string') err(`${at}/url`, 'out_of_band requires a url');
+      else if (!r.url.startsWith('https://')) err(`${at}/url`, 'url must be https');
+    }
+    if (r.kind === 'declaration') {
+      if (!r.schema || typeof r.schema !== 'object') err(`${at}/schema`, 'declaration requires a schema');
       else {
         const bad = unsupportedKeywords(r.schema);
         if (bad.length) err(`${at}/schema`, `unsupported keywords: ${bad.join(', ')}`);
       }
     }
-    if (r.mode === 'proof' && (!Array.isArray(r.accepted_proof_types) || !r.accepted_proof_types.length)) {
-      err(`${at}/accepted_proof_types`, 'proof mode requires accepted_proof_types');
+    if (r.kind === 'evidence' && (!Array.isArray(r.accepted_evidence) || !r.accepted_evidence.length)) {
+      err(`${at}/accepted_evidence`, 'evidence requests must list accepted evidence classes');
     }
-    if (r.mode === 'url') {
-      if (typeof r.url !== 'string') err(`${at}/url`, 'url mode requires a url');
-      else if (!r.url.startsWith('https://')) err(`${at}/url`, 'url must be https');
+    if (r.kind === 'evidence' && Array.isArray(r.accepted_evidence)) {
+      for (const cls of r.accepted_evidence) {
+        if (!EVIDENCE_CLASSES.includes(cls)) err(`${at}/accepted_evidence`, `unknown evidence class "${cls}"`);
+      }
+      if (r.accepted_evidence.includes('self_asserted')) {
+        err(`${at}/accepted_evidence`, 'self_asserted is not evidence; use kind "declaration"');
+      }
+    }
+    if (r.kind === 'task') {
+      if (!r.limits || typeof r.limits.max_duration_ms !== 'number') {
+        err(`${at}/limits`, 'task requests must declare limits.max_duration_ms');
+      }
+      if (!r.output_schema || typeof r.output_schema !== 'object') {
+        err(`${at}/output_schema`, 'task requests must declare an output_schema');
+      }
     }
   });
 
   return errors;
+}
+
+function isLoopback(url: string): boolean {
+  const origin = originOf(url);
+  return !!origin && /^https?:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:\d+)?$/.test(origin);
 }
 
 export function isExpired(challenge: Pick<Challenge, 'expires_at'>, now = new Date()): boolean {
@@ -325,9 +499,8 @@ export function isExpired(challenge: Pick<Challenge, 'expires_at'>, now = new Da
 }
 
 /**
- * Fields a server must never ask for through in-band `form` mode. These are
- * either secrets or the agent's own operating context; a challenge asking for
- * them is an attack, not a policy.
+ * Fields a server must never ask for in band. Secrets, or the agent's own
+ * operating context. A challenge asking for these is an attack.
  */
 export const FORBIDDEN_FIELD_HINTS = [
   'password', 'passwd', 'secret', 'api_key', 'apikey', 'access_token',
@@ -338,14 +511,23 @@ export const FORBIDDEN_FIELD_HINTS = [
 ];
 
 /**
- * Heuristic guard clients run over an incoming challenge. It is a smell test,
- * not a security boundary — the real boundary is that a client only ever fills
- * fields its own policy has approved.
+ * Heuristic guard clients run over an incoming challenge. A smell test, not
+ * a security boundary — the boundary is that a client only fills fields its
+ * own policy approved.
  */
 export function suspiciousRequests(challenge: Challenge): InputRequest[] {
   return challenge.input_requests.filter((r) => {
-    if (r.mode !== 'form') return false;
+    if (r.interaction !== 'inline') return false;
     const haystack = `${r.id} ${r.message} ${r.reason ?? ''}`.toLowerCase();
     return FORBIDDEN_FIELD_HINTS.some((hint) => haystack.includes(hint));
   });
+}
+
+/** Total declared cost of the `task` requests in a challenge. */
+export function taskCost(challenge: Challenge): { count: number; maxDurationMs: number } {
+  const tasks = challenge.input_requests.filter((r) => r.kind === 'task');
+  return {
+    count: tasks.length,
+    maxDurationMs: tasks.reduce((sum, t) => sum + (t.limits?.max_duration_ms ?? 0), 0),
+  };
 }

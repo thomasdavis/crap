@@ -3,8 +3,8 @@
  *
  * The design rule: the SERVER asks, the CLIENT decides. A resolver you supply
  * decides what may be answered autonomously, what needs a human, and what is
- * refused outright. Nothing in a challenge can make this library answer a
- * question your policy did not approve.
+ * refused. Nothing in a challenge can make this library answer a question your
+ * policy did not approve, or send an answer to an origin that did not ask.
  */
 
 import {
@@ -16,7 +16,9 @@ import {
   STATUS_COMPAT,
   STATUS_INPUT_REQUIRED,
   isExpired,
+  originOf,
   suspiciousRequests,
+  taskCost,
   validateChallenge,
   validateValue,
   type AnswerValue,
@@ -27,7 +29,6 @@ import {
 
 export * from '@thomasdavis/crap-schema';
 
-/** What a resolver may return for one question. */
 export type Answer =
   | { kind: 'answer'; value: AnswerValue }
   | { kind: 'decline'; reason?: string };
@@ -37,15 +38,17 @@ export const decline = (reason?: string): Answer => ({ kind: 'decline', reason }
 
 export interface ResolverContext {
   challenge: Challenge;
-  /** The request that triggered the challenge. */
   request: { method: string; url: string };
 }
 
+export type RequestHandler = (request: InputRequest, ctx: ResolverContext) => Promise<Answer> | Answer;
+
+/** One handler per request kind. Anything unhandled is declined. */
 export interface Resolver {
-  form?(request: InputRequest, ctx: ResolverContext): Promise<Answer> | Answer;
-  proof?(request: InputRequest, ctx: ResolverContext): Promise<Answer> | Answer;
-  approval?(request: InputRequest, ctx: ResolverContext): Promise<Answer> | Answer;
-  url?(request: InputRequest, ctx: ResolverContext): Promise<Answer> | Answer;
+  declaration?: RequestHandler;
+  evidence?: RequestHandler;
+  approval?: RequestHandler;
+  task?: RequestHandler;
 }
 
 export interface CrapFetchOptions extends RequestInit {
@@ -53,13 +56,24 @@ export interface CrapFetchOptions extends RequestInit {
   /** Max challenge rounds this client will play along with. Default 3. */
   maxRounds?: number;
   fetch?: typeof globalThis.fetch;
-  /** Called for every challenge received — logging, metrics, human display. */
   onChallenge?(challenge: Challenge): void;
   /**
    * Refuse challenges whose questions smell like secret-harvesting or
    * context-exfiltration. Default true. Turning this off is on you.
    */
   guardSuspicious?: boolean;
+  /**
+   * Refuse a challenge whose declared `task` work exceeds this budget.
+   * Default 0 — tasks are opt-in, because a question that costs real compute
+   * is a job, not a question.
+   */
+  taskBudgetMs?: number;
+  /**
+   * Permit `submission.target` on an origin other than the issuer. Default
+   * false. Enabling it without a verified delegation is how declarations end
+   * up at someone else's server.
+   */
+  allowCrossOriginSubmission?: boolean;
 }
 
 export class CrapError extends Error {
@@ -77,9 +91,17 @@ export class ChallengeDeclined extends CrapError {
   }
 }
 
+/** Thrown when a challenge fails structural or binding validation. */
+export class ChallengeRejected extends CrapError {
+  constructor(message: string, readonly detail: unknown) {
+    super(message, detail);
+    this.name = 'ChallengeRejected';
+  }
+}
+
 /**
- * fetch(), with the protocol bolted on: if the resource asks questions, answer
- * them (per your resolver) and retry the original request once per round.
+ * fetch(), with the protocol bolted on: if the resource requires input,
+ * satisfy it (per your resolver) and retry the original request.
  */
 export async function crapFetch(
   input: string | URL,
@@ -91,11 +113,14 @@ export async function crapFetch(
     fetch: doFetch = globalThis.fetch,
     onChallenge,
     guardSuspicious = true,
+    taskBudgetMs = 0,
+    allowCrossOriginSubmission = false,
     ...init
   } = options;
 
   const url = typeof input === 'string' ? input : input.toString();
   const method = (init.method ?? 'GET').toUpperCase();
+  const hasContent = init.body !== undefined && init.body !== null && `${init.body}`.length > 0;
   const headers = new Headers(init.headers);
   headers.set(HEADER_ACCEPT, ACCEPT_VALUE);
 
@@ -112,22 +137,35 @@ export async function crapFetch(
 
     onChallenge?.(challenge);
 
-    const problems = validateChallenge(challenge);
+    // Binding checks first: does this challenge belong to this exchange?
+    const problems = validateChallenge(challenge, {
+      responseOrigin: originOf(response.url || url),
+      request: { method, url, hasContent },
+      allowCrossOriginSubmission,
+    });
     if (problems.length) {
-      throw new CrapError('server sent a malformed challenge', problems);
+      throw new ChallengeRejected('challenge failed validation', problems);
     }
     if (isExpired(challenge)) {
-      throw new CrapError('server sent an already-expired challenge');
+      throw new ChallengeRejected('challenge is already expired', challenge.expires_at);
     }
     if (guardSuspicious) {
       const bad = suspiciousRequests(challenge);
       if (bad.length) {
         throw new ChallengeDeclined(
-          'challenge asks for secrets or agent context in form mode; refusing',
+          'challenge asks for secrets or agent context in band; refusing',
           challenge,
           bad.map((r) => r.id),
         );
       }
+    }
+    const cost = taskCost(challenge);
+    if (cost.count && cost.maxDurationMs > taskBudgetMs) {
+      throw new ChallengeDeclined(
+        `challenge demands up to ${cost.maxDurationMs}ms of work, over the ${taskBudgetMs}ms budget`,
+        challenge,
+        challenge.input_requests.filter((r) => r.kind === 'task').map((r) => r.id),
+      );
     }
 
     proof = await satisfy(challenge, { method, url }, resolver, doFetch);
@@ -136,7 +174,7 @@ export async function crapFetch(
   throw new CrapError(`challenge loop exceeded ${maxRounds} rounds`);
 }
 
-/** Answer every question in a challenge and return the continuation proof. */
+/** Answer every request in a challenge and return the continuation proof. */
 export async function satisfy(
   challenge: Challenge,
   request: { method: string; url: string },
@@ -148,7 +186,7 @@ export async function satisfy(
   const declined: string[] = [];
 
   for (const req of challenge.input_requests) {
-    const handler = resolver[req.mode];
+    const handler = resolver[req.kind];
     if (!handler) {
       declined.push(req.id);
       continue;
@@ -160,8 +198,9 @@ export async function satisfy(
     }
     // Validate our own answer before sending it — a round trip to be told the
     // enum has three values, none of them the one we invented, is a waste.
-    if (req.mode === 'form' && req.schema) {
-      const errors = validateValue(result.value, req.schema, `/${req.id}`);
+    const schema = req.kind === 'task' ? req.output_schema : req.schema;
+    if (schema) {
+      const errors = validateValue(result.value, schema, `/${req.id}`);
       if (errors.length) {
         throw new CrapError(`answer for "${req.id}" does not satisfy the server's schema`, errors);
       }
@@ -206,11 +245,11 @@ export async function satisfy(
   }
 
   const proof = submission.headers.get(HEADER_INPUT_PROOF);
-  if (!proof) throw new CrapError('server accepted answers but issued no Input-Proof');
+  if (!proof) throw new CrapError('server accepted the submission but issued no Input-Proof');
   return proof;
 }
 
-/** Recognise both profiles: native 430, and 403 + the problem type. */
+/** Recognise both profiles: compatibility `403`, and native `430`. */
 export async function extractChallenge(response: Response): Promise<Challenge | undefined> {
   if (response.status !== STATUS_INPUT_REQUIRED && response.status !== STATUS_COMPAT) return undefined;
   const contentType = response.headers.get('content-type') ?? '';
@@ -232,9 +271,9 @@ export async function extractChallenge(response: Response): Promise<Challenge | 
  * amount of persuasive challenge prose changes what gets sent.
  */
 export function staticResolver(values: Record<string, AnswerValue>): Resolver {
-  const lookup = (req: InputRequest): Answer =>
+  const lookup: RequestHandler = (req) =>
     req.id in values ? answer(values[req.id]) : decline('not pre-approved');
-  return { form: lookup, proof: lookup, approval: lookup, url: lookup };
+  return { declaration: lookup, evidence: lookup, approval: lookup, task: lookup };
 }
 
 function cryptoRandom(): string {
