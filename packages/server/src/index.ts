@@ -331,7 +331,7 @@ export class CrapServer {
         'cache-control': 'no-store',
         vary: HEADER_ACCEPT,
         [HEADER_CHALLENGE_ID]: challenge.id,
-        link: `<${challenge.submission.target}>; rel="https://crap.donto.org/rels/submit-input"`,
+        link: `<${challenge.submission.target}>; rel="https://crap.blah.dev/rels/submit-input"`,
       },
       body: JSON.stringify(problem, null, 2),
     };

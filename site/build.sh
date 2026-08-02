@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the crap.donto.org static site from the repo's own markdown.
+# Build the crap.blah.dev static site from the repo's own markdown.
 # Usage: site/build.sh [outdir]   (default /srv/crap-site)
 set -euo pipefail
 

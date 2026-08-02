@@ -1,7 +1,7 @@
 {
   "protocol": "crap",
   "version": 1,
-  "problem_type": "https://crap.donto.org/problems/input-required",
+  "problem_type": "https://crap.blah.dev/problems/input-required",
   "response_media_type": "application/crap-response+json",
   "status_code": 430,
   "compatibility_status_code": 403,
@@ -12,6 +12,6 @@
   },
   "modes": ["form", "proof", "approval", "url"],
   "assurance_levels": ["A0", "A1", "A2", "A3", "A4"],
-  "spec": "https://crap.donto.org/spec.html",
+  "spec": "https://crap.blah.dev/spec.html",
   "source": "https://github.com/thomasdavis/crap"
 }

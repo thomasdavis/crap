@@ -16,7 +16,7 @@ export const CRAP_VERSION = 2 as const;
 export const STATUS_COMPAT = 403 as const;
 export const STATUS_INPUT_REQUIRED = 430 as const;
 
-export const PROBLEM_TYPE = 'https://crap.donto.org/problems/input-required';
+export const PROBLEM_TYPE = 'https://crap.blah.dev/problems/input-required';
 export const PROBLEM_MEDIA_TYPE = 'application/problem+json';
 export const RESPONSE_MEDIA_TYPE = 'application/crap-response+json';
 

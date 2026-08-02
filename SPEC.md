@@ -4,7 +4,7 @@
 **Status:** working draft, no IANA registrations, breaking changes expected
 **Normative baseline:** `403` + `application/problem+json`
 **Optional negotiated profile:** `430 Input Required` (provisional squat)
-**Problem type:** `https://crap.donto.org/problems/input-required`
+**Problem type:** `https://crap.blah.dev/problems/input-required`
 **Response media type:** `application/crap-response+json`
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be interpreted
@@ -130,7 +130,7 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
 
 ```json
 {
-  "type": "https://crap.donto.org/problems/input-required",
+  "type": "https://crap.blah.dev/problems/input-required",
   "title": "Input Required",
   "status": 403,
   "detail": "This resource requires additional input before it can be served.",
@@ -518,7 +518,7 @@ produced, and SHOULD NOT make consequential decisions on `self_asserted` alone.
 
 Nothing is registered. A future version would request:
 
-1. **Problem type** `https://crap.donto.org/problems/input-required` (Specification Required) — the achievable near-term step.
+1. **Problem type** `https://crap.blah.dev/problems/input-required` (Specification Required) — the achievable near-term step.
 2. **Media type** `application/crap-response+json`.
 3. **Well-known URI** `input-challenges`.
 4. **Field names** `Accept-Input-Required`, `Input-Proof`, `Challenge-Id`.

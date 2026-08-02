@@ -1,6 +1,6 @@
 # Problem type: `input-required`
 
-**URI:** `https://crap.donto.org/problems/input-required`
+**URI:** `https://crap.blah.dev/problems/input-required`
 **Status codes:** `430 Input Required` (native) · `403 Forbidden` (compatibility)
 **Defined by:** [CRAP v0.1](/spec.html)
 
@@ -41,7 +41,7 @@ cap them too, but that's the server's promise, not your guarantee.
 
 ```json
 {
-  "type": "https://crap.donto.org/problems/input-required",
+  "type": "https://crap.blah.dev/problems/input-required",
   "title": "Input Required",
   "status": 430,
   "detail": "human-readable explanation of what's missing",

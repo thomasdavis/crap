@@ -154,7 +154,7 @@ new CrapServer({
 
 Registering an HTTP status code takes years. So:
 
-- **Compatibility (normative)** — `403` + `application/problem+json` ([RFC 9457](https://www.rfc-editor.org/info/rfc9457/)), problem type `https://crap.donto.org/problems/input-required`. Works through every proxy and SDK that exists today.
+- **Compatibility (normative)** — `403` + `application/problem+json` ([RFC 9457](https://www.rfc-editor.org/info/rfc9457/)), problem type `https://crap.blah.dev/problems/input-required`. Works through every proxy and SDK that exists today.
 - **Native (optional)** — client sends `Accept-Input-Required: v=2` as an RFC 9651 structured field, server may answer `430`.
 
 The server picks automatically. Clients detect a challenge by the problem type,
