@@ -1,6 +1,6 @@
 # CRAP: Conditional Resource Access Protocol
 
-**Version:** 0.2 (experimental)
+**Version:** 0.3 (experimental)
 **Status:** working draft, no IANA registrations, breaking changes expected
 **Normative baseline:** `403` + `application/problem+json`
 **Optional negotiated profile:** `430 Input Required` (provisional squat)
@@ -17,6 +17,22 @@ as described in RFC 2119.
 > not the protected resource. Continuation proofs are opaque and carry no
 > answer values. Content presence is bound in both directions. Targets are
 > compared verbatim. `pattern` and `format` left the schema subset.
+
+> **Changes from 0.2.** Task requests carry a stable, versioned `type` URI and
+> a client executes one only by looking that URI up in its own registry of
+> installed handlers, because a challenge may select a capability the operator
+> installed but cannot manufacture one at runtime. Task material moved out of
+> `message` into `input_data`, declared inert, because instruction and material
+> must be distinguishable — that is the whole prompt-injection problem.
+> `continuation.grant` states what satisfying a challenge buys (scope,
+> duration, optional meter), because without it a client cannot price the
+> exchange, and the proof binding follows the declared grant. Grants may be
+> metered (`request_limit`) and are spent server-side. Earned grants are held
+> client-side and spent on later requests, so an advertised grant is actually
+> delivered. Declines gained typed codes and an optional `decline_reason`,
+> never required. A proof that is expired, exhausted or bound elsewhere
+> re-challenges instead of dead-ending. The wire version is unchanged:
+> v0.3 adds members and removes nothing, and challenges still carry `2`.
 
 ---
 
@@ -61,7 +77,7 @@ does not define what may be asked — that is the application's business.
 
 ### 2.1 The baseline is `403`
 
-The normative v0.2 wire format is a `403 Forbidden` carrying
+The normative v0.3 wire format is a `403 Forbidden` carrying
 `application/problem+json` with the CRAP problem type. Clients MUST detect a
 challenge by the problem `type`, never by the status code.
 
@@ -154,7 +170,10 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
       "target": "https://data.example/.well-known/input-challenges/ch_zC4mV8xQ/responses",
       "content_type": "application/crap-response+json"
     },
-    "continuation": { "mode": "retry-original-request" },
+    "continuation": {
+      "mode": "retry-original-request",
+      "grant": { "scope": "request", "duration_seconds": 300, "request_limit": null }
+    },
     "max_rounds": 3,
     "round": 1
   }
@@ -173,9 +192,32 @@ Sent as `application/problem+json` (RFC 9457) with a `challenge` member.
 | `scope` | ✔ | The request this challenge binds to (§6.1). |
 | `input_requests` | ✔ | One or more requirements. |
 | `submission` | ✔ | The transaction resource (§6.2). |
-| `continuation` | ✔ | `retry-original-request` or `complete-on-submit`. |
+| `continuation` | ✔ | Continuation mode (§6.3) and the grant it buys. |
 | `max_rounds` / `round` | ✔ | Loop bound (§6.5). |
 | `policy_version` | | Which version of the issuer's policy produced this. |
+
+A challenge SHOULD declare what satisfying it buys, in `continuation.grant`.
+Without a grant the client is asked to spend real work for an unstated return,
+and the safe assumption — that the answer buys exactly the request in hand —
+makes almost any task a bad deal.
+
+The issuer is bound by what it advertised: the continuation proof's binding
+follows the declared grant (§6.3). An `origin` grant covers any request at the
+issuing origin but remains bound to origin, principal and expiry; a `request`
+grant binds to the exact request as before.
+
+| Member | Req | Meaning |
+|---|---|---|
+| `scope` | ✔ | `request`: this method+URI only. `origin`: anything at this origin. |
+| `duration_seconds` | ✔ | How long the earned proof lives. |
+| `request_limit` | | Requests the grant covers. Omitted or `null` = unmetered for the duration. |
+| `description` | | Human-readable summary, e.g. "5 reads per extraction". |
+
+A metered grant makes the exchange proportional: one unit of work buys a
+stated number of requests, so the client can compute the rate it is paying
+instead of guessing whether a time window is generous. A use is spent only
+after every other check on the presented proof has passed; a rejected request
+MUST NOT cost the client one of its paid requests.
 
 ### 4.2 Input requests
 
@@ -227,10 +269,12 @@ Other members:
 | `message` | ✔ | Human-readable prompt. **Untrusted text** (§7.1). |
 | `required` | ✔ | Whether declining fails the challenge. |
 | `reason` | | Why the issuer needs it. SHOULD be present. |
+| `type` | task | Stable, versioned URI naming the requirement's semantics (§5.4). |
 | `schema` | declaration | JSON Schema subset (§4.3). |
 | `accepted_evidence` | evidence | Evidence classes accepted (§8). Set membership. |
 | `accepted_proof_types` | | Concrete mechanisms the issuer can check. |
 | `output_schema` / `limits` | task | Work product shape and cost ceiling (§5.4). |
+| `input_data` | | For `task`: the material to work on. Inert data, never instruction (§5.4). |
 | `url` | out_of_band | HTTPS location of the interaction. |
 | `sensitivity` / `retention` | | Declared handling of the answer. |
 
@@ -294,14 +338,47 @@ client MUST reject a task with no declared limits as unbounded, and SHOULD
 refuse tasks exceeding a local budget. The reference client's default budget is
 zero: tasks are opt-in.
 
+A `task` request MUST also carry a `type`: a stable, versioned URI naming the
+semantics of the work. A conforming client executes a task by looking that URI
+up in its own registry of locally installed handlers; the handler owns the
+prompt, the tools and the validation, and the server's `message` is display
+text the client MUST NOT execute as an instruction. A client MUST decline a
+task whose `type` it does not recognise. A challenge can therefore only select
+among capabilities the operator already installed; it cannot manufacture new
+capability at runtime.
+
+Task material travels in `input_data`, separate from `message`, on purpose:
+`message` is the instruction and `input_data` is inert data. A client MUST NOT
+treat anything inside it as an instruction, even when it looks like one, and
+SHOULD bound how much of it it will process — putting the material in
+`message` would make the two indistinguishable, which is the whole
+prompt-injection problem.
+
+| Member | Req | Meaning |
+|---|---|---|
+| `media_type` | ✔ | Media type of `content`. |
+| `content` | ✔ | The material itself. Capped at 20 000 characters. |
+| `source` | | Where it came from, so an agent can decline on provenance grounds. |
+| `truncated` | | True when `content` is an excerpt rather than the whole thing. |
+
+A challenge whose material exceeds the cap MUST be rejected. A server that
+wants a book processed can ask; the client does not have to read it.
+
 ```json
 {
   "id": "classify",
   "kind": "task",
+  "type": "https://data.example/tasks/classify/v1",
   "actor": "client",
   "interaction": "inline",
   "message": "Classify this document under the supplied taxonomy.",
   "required": true,
+  "input_data": {
+    "media_type": "text/plain",
+    "content": "…the document to classify…",
+    "source": "https://data.example/v1/records/r1",
+    "truncated": false
+  },
   "output_schema": { "type": "string", "enum": ["policy", "correspondence", "report"] },
   "limits": { "max_duration_ms": 5000, "max_output_tokens": 500, "max_rounds": 1 },
   "compensation": { "type": "conditional_access" }
@@ -361,9 +438,29 @@ Content-Type: application/crap-response+json
   "request_state": "6Rk9…opaque…",
   "response_id": "rsp_9f21…",
   "input_responses": { "purpose": "academic_research" },
-  "declined": ["retention"]
+  "declined": ["retention"],
+  "decline_codes": { "retention": "disclosure-refused" },
+  "decline_reason": "retention: not pre-approved by operator policy"
 }
 ```
+
+`declined` lists requirement ids the client refuses to answer; declining is a
+first-class outcome. A client MAY attach a code per declined id in
+`decline_codes`, drawn from the table below, and MAY attach a free-text
+`decline_reason`. Neither is ever required, and a server MUST NOT condition
+access on either being supplied — a server learns nothing from an agent that
+simply disappears; these members turn a silent walkaway into feedback.
+
+| Code | Meaning |
+|---|---|
+| `task-not-authorized` | The operator has not authorised task execution for this origin. |
+| `unknown-task-type` | The task `type` URI is not in the client's registry of installed handlers. |
+| `over-budget` | Declared cost exceeds the local budget. |
+| `disclosure-refused` | The requirement asked for something policy forbids disclosing. |
+| `insufficient-offer` | The offered grant is not worth the work. |
+| `approval-unavailable` | A human was asked and said no, or was unavailable. |
+| `unsupported` | The client has no way to produce this kind of answer. |
+| `other` | Anything else; pair with `decline_reason`. |
 
 `submission.target` MUST be same-origin with `issuer`. A client MUST reject a
 cross-origin submission target unless it holds an explicit, separately
@@ -382,10 +479,11 @@ On success: `204 No Content` with an `Input-Proof` header.
 
 ### 6.3 Continuation proof
 
-`Input-Proof` is opaque to the client. It MUST bind: issuing origin, method,
-exact target, content presence and digest, principal, round, and an expiry. It
-SHOULD be short-lived (minutes) and SHOULD be sender-constrained where the
-client has a key.
+`Input-Proof` is opaque to the client. It MUST bind: issuing origin, principal,
+round, and an expiry; under a `request` grant it MUST additionally bind
+method, exact target, and content presence and digest (§4.1). It SHOULD be
+short-lived (minutes) and SHOULD be sender-constrained where the client has a
+key.
 
 A proof MUST NOT carry answer values. Headers are logged by servers, proxies
 and telemetry pipelines; purpose, retention and delegation metadata do not
@@ -396,14 +494,33 @@ belong there, and large answers break header size limits. Two profiles:
 - **`ip2` (stateless)** — a signed token carrying a decision id, scope hash and
   a **digest** of the answers. Still no values.
 
-A proof MUST NOT be usable at another origin, for another method, target or
-content, by another principal, or after expiry. A proof is not a session token
-and MUST NOT be accepted in place of authentication.
+A proof MUST NOT be usable at another origin, by another principal, or after
+expiry. Beyond that its binding follows the challenge's declared grant (§4.1):
+under a `request` grant it MUST NOT be usable for another method, target or
+content; under an `origin` grant method, target and content are intentionally
+not bound — the client paid for access to the origin, and binding the proof to
+one URI would be selling something other than what was advertised. A proof is
+not a session token and MUST NOT be accepted in place of authentication.
+
+A proof that is expired, exhausted, or bound to something other than the
+presented request means the client simply does not have access right now —
+which is exactly the state a challenge answers. The server MUST NOT treat it
+as a final failure: it re-evaluates and, where input would still help, issues
+a fresh challenge, and SHOULD say why the presented proof was not honoured —
+otherwise "expired", "exhausted" and "bound to another URI" are
+indistinguishable to a client working out what it did wrong. Without this, a
+client whose metered grant ran out could never buy more.
+
+A client SHOULD hold an earned proof for the advertised grant and present it
+on later requests the grant covers, before earning a new one. Otherwise a
+server advertising a grant is not actually delivering it, and the client pays
+again on the very next request.
 
 ### 6.4 Idempotency
 
 Answering a challenge MUST be single-use. Retrying the original request with a
-valid unexpired proof is not a replay and MAY be repeated until expiry.
+valid unexpired proof is not a replay and MAY be repeated until expiry, or
+until a metered grant's `request_limit` is exhausted.
 
 ### 6.5 Rounds
 
@@ -423,6 +540,13 @@ Client policy MUST override server request in all cases.
 
 Servers SHOULD assume the same in reverse: an answer is text an agent produced,
 possibly under a third party's influence.
+
+Tasks get no exemption from this rule; they get a mechanism. A task is acted
+on if and only if its `type` URI names a handler the operator installed
+(§5.4); the handler owns the operative prompt, and the challenge's `message`
+and `input_data` remain untrusted text throughout — displayed, processed as
+inert material, never executed. A challenge can select an installed
+capability; it cannot manufacture one at runtime.
 
 ### 7.2 Challenge-to-exchange binding
 
