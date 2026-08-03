@@ -1,0 +1,33 @@
+{
+  "name": "@thomasdavis/crap-gateway",
+  "version": "0.1.0",
+  "description": "CRAP (Conditional Resource Access Protocol) \u2014 gateway",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thomasdavis/crap.git",
+    "directory": "packages/gateway"
+  },
+  "dependencies": {
+    "@thomasdavis/crap-server": "^0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
